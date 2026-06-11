@@ -1,0 +1,99 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "outlier_embeddings"
+version = "0.1.0"
+description = "Embedding-based outlier scoring for WorldCereal reference data"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+# ── Core runtime dependencies ─────────────────────────────────────────────────
+# These are the packages required to import and run the main pipeline.
+# worldcereal is listed as an optional install-from-source dependency
+# (see the note below under [project.optional-dependencies]).
+dependencies = [
+    # Spatial / data
+    "duckdb>=1.4.0",
+    "geopandas",
+    "h3~=4.1.0",
+    "numpy>=2.0.0",
+    "pandas",
+    "pyarrow",
+    # ML / embeddings
+    "scikit-learn",
+    "torch>=2.3.0",
+    # Logging / progress
+    "loguru>=0.7.2",
+    "tqdm",
+    # WorldCereal Presto backbone — must be installed separately if not already present.
+    # Install with:  pip install "prometheo @ git+https://github.com/WorldCereal/prometheo.git@v0.0.5"
+    "prometheo",
+    # WorldCereal main package — install from main branch before this package.
+    # Install with:  pip install "worldcereal @ git+https://github.com/WorldCereal/worldcereal-classification.git@main"
+    # Or locally:    pip install -e /path/to/worldcereal-classification
+    "worldcereal",
+]
+
+[project.optional-dependencies]
+# CatBoost-based downstream training experiments (experiments.py)
+experiments = [
+    "catboost~=1.2.8",
+]
+
+# SharePoint access for fetching the legend/mapping Excel
+sharepoint = [
+    "Office365-REST-Python-Client",
+]
+
+# Notebook environment
+notebooks = [
+    "jupyter",
+    "ipywidgets",
+    "matplotlib",
+    "seaborn",
+    "folium",
+]
+
+# Everything
+all = [
+    "outlier_embeddings[experiments,sharepoint,notebooks]",
+]
+
+# Test dependencies
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/outlier_embeddings"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/",
+    "scripts/",
+    "notebooks/",
+    "tests/",
+    "README.md",
+    "pyproject.toml",
+]
+
+# ── Ruff ─────────────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]  # line too long — handled by formatter
+
+# ── Pytest ───────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
