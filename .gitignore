@@ -1,0 +1,66 @@
+# Python / byte-compiled
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Jupyter / IPython checkpoints
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# DuckDB database files (often large; store externally)
+*.duckdb
+*.duckdb.wal
+
+# Parquet / data files
+*.parquet
+*.geoparquet
+*.gpkg
+
+# Excel / output files
+*.xlsx
+*.xls
+*.csv
+
+# SLURM logs
+slurm-*.out
+*.slurm.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+
+# Ruff
+.ruff_cache/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Test artefacts
+.pytest_cache/
+
+# Local credential / env files
+.sharepointenv
+*.env
+
+# Allow test resources
+!tests/testresources/**
