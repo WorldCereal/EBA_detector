@@ -1370,11 +1370,18 @@ def flag_anomalies(
         g["flagged"] = flags
         return g
 
-    flagged_df = (
-        df_scores.groupby(group_keys, group_keys=False)
-        .apply(_flag_group, include_groups=False)
-        .reset_index(drop=True)
-    )
+    import warnings as _warnings
+    with _warnings.catch_warnings():
+        _warnings.filterwarnings(
+            "ignore",
+            message="DataFrameGroupBy.apply operated on the grouping columns",
+            category=FutureWarning,
+        )
+        flagged_df = (
+            df_scores.groupby(group_keys, group_keys=False)
+            .apply(_flag_group)
+            .reset_index(drop=True)
+        )
 
     summary = (
         flagged_df.groupby(group_keys)
