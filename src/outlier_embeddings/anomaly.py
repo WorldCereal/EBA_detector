@@ -877,6 +877,11 @@ def run_pipeline(
         for col in score_outlier_cols:
             if col not in df_skipped.columns:
                 df_skipped[col] = np.nan
+        # Ensure schema alignment before concat to avoid FutureWarning on all-NA columns
+        for col in flagged_df.columns:
+            if col not in df_skipped.columns:
+                df_skipped[col] = np.nan
+        df_skipped = df_skipped.reindex(columns=flagged_df.columns)
         flagged_df = pd.concat([flagged_df, df_skipped], axis=0, ignore_index=True)
         print(f"[anomaly] Re-attached {len(df_skipped):,} skipped-class rows with NaN scores.")
 

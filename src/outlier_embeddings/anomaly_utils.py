@@ -1372,7 +1372,7 @@ def flag_anomalies(
 
     flagged_df = (
         df_scores.groupby(group_keys, group_keys=False)
-        .apply(_flag_group)
+        .apply(_flag_group, include_groups=False)
         .reset_index(drop=True)
     )
 

@@ -325,7 +325,7 @@ def compute_embeddings(
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=num_workers > 0,
             collate_fn=_collate_predictors_with_ids,
         )
         model.eval().to(device)
