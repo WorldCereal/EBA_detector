@@ -1,4 +1,5 @@
 # outlier_embeddings <!-- omit in toc -->
+Refactored from the `outliers-from-embeddings` branch of `worldcereal-classification` into a standalone package for better modularity and maintainability.
 
 A private companion package to [WorldCereal classification](https://github.com/WorldCereal/worldcereal-classification) that detects anomalous / potentially mislabelled samples in WorldCereal reference datasets by operating directly on pre-computed **Presto embedding vectors**.
 
@@ -16,7 +17,7 @@ This package provides a self-contained pipeline that:
 5. **Assigns** per-sample confidence scores and anomaly categories (`normal / flagged / suspect / candidate`).
 6. **Writes** the 6 anomaly columns (`LC10_confidence_nonoutlier`, `LC10_anomaly_flag`, `outlier_LC10_cls`, `CTY24_*`) back to the long-format parquet files.
 
-An **incremental update** mode (`--mode update`) re-scores only the geographic impact zone of newly added datasets — no need to reprocess the entire collection.
+An **incremental update** mode (`--mode update`) re-scores only the geographic impact zone of newly added datasets : no need to reprocess the entire collection.
 
 ---
 
@@ -70,7 +71,7 @@ Everything else (scoring, flagging, caching, incremental updates) lives entirely
 
 ## Installation
 
-### Step 1 — Install worldcereal from main
+### Step 1 : Install worldcereal from main
 
 ```bash
 pip install "worldcereal[train] @ git+https://github.com/WorldCereal/worldcereal-classification.git@main"
@@ -82,13 +83,13 @@ Or from a local clone:
 pip install -e /path/to/worldcereal-classification
 ```
 
-### Step 2 — Install outlier_embeddings (this package)
+### Step 2 : Install outlier_embeddings (this package)
 
 ```bash
 # From the private repo:
 pip install "outlier_embeddings @ git+https://github.com/WorldCereal/outlier_embeddings.git"
 
-# Or from a local checkout (editable install — recommended for development):
+# Or from a local checkout (editable install : recommended for development):
 pip install -e /path/to/outlier_embeddings
 ```
 
@@ -164,7 +165,7 @@ variables (see `scripts/get_mappings_from_legend.py` for the expected variable n
 
 ## Modules in detail
 
-### `anomaly_utils.py` — Pure computation helpers
+### `anomaly_utils.py` : Pure computation helpers
 
 Stateless building blocks; no DuckDB, no disk I/O:
 
@@ -176,7 +177,7 @@ Stateless building blocks; no DuckDB, no disk I/O:
 - **Incremental helpers**: `find_unscored_samples`, `compute_impact_zone`,
   `load_affected_embeddings_from_cache`, `merge_scores_to_long_parquets`
 
-### `anomaly.py` — Pipeline orchestrator
+### `anomaly.py` : Pipeline orchestrator
 
 `run_pipeline(...)` wires together all the helpers above into a complete run:
 
@@ -190,24 +191,24 @@ output write
 Supports **incremental mode** (`skip_existing_samples=True`) to avoid rescoring
 already-processed samples.
 
-### `embeddings_cache.py` — DuckDB embedding cache
+### `embeddings_cache.py` : DuckDB embedding cache
 
-- `init_cache(db_path)` — create / open the embeddings table
-- `compute_embeddings(data_df, model, ...)` — run Presto inference and insert results
-- `insert_embeddings / fetch_embeddings` — low-level batch I/O
-- `get_model_hash(model)` — SHA-256 fingerprint of model weights
+- `init_cache(db_path)` : create / open the embeddings table
+- `compute_embeddings(data_df, model, ...)` : run Presto inference and insert results
+- `insert_embeddings / fetch_embeddings` : low-level batch I/O
+- `get_model_hash(model)` : SHA-256 fingerprint of model weights
   (segments cache per model version so swapping the backbone is safe)
 
-### `experiments.py` — CatBoost downstream training
+### `experiments.py` : CatBoost downstream training
 
 Train a CatBoost classifier on top of outlier confidence scores to evaluate whether
 the flagging is meaningful (requires `catboost` extra).
 
-### `scripts/compute_anomaly_scores.py` — Full CLI
+### `scripts/compute_anomaly_scores.py` : Full CLI
 
 End-to-end pipeline script with full argument parsing. Run `python scripts/compute_anomaly_scores.py --help` for all options.
 
-### `scripts/get_mappings_from_legend.py` — SharePoint utilities
+### `scripts/get_mappings_from_legend.py` : SharePoint utilities
 
 Fetches the WorldCereal legend Excel from SharePoint and builds the class-mapping JSON
 used by the pipeline. Can also be used standalone to regenerate `class_mappings.json`.
@@ -220,10 +221,10 @@ The pipeline appends six columns to the long-format parquet files:
 
 | Column | Description |
 |---|---|
-| `LC10_confidence_nonoutlier` | P(not outlier) under LANDCOVER10 mapping — float32 in [0, 1] |
+| `LC10_confidence_nonoutlier` | P(not outlier) under LANDCOVER10 mapping : float32 in [0, 1] |
 | `LC10_anomaly_flag` | Anomaly category under LC10: `normal / flagged / suspect / candidate` |
 | `outlier_LC10_cls` | Label class used for LC10 scoring |
-| `CTY24_confidence_nonoutlier` | P(not outlier) under CROPTYPE24 mapping — float32 in [0, 1] |
+| `CTY24_confidence_nonoutlier` | P(not outlier) under CROPTYPE24 mapping : float32 in [0, 1] |
 | `CTY24_anomaly_flag` | Anomaly category under CTY24: `normal / flagged / suspect / candidate` |
 | `outlier_CTY24_cls` | Label class used for CTY24 scoring |
 
@@ -241,7 +242,7 @@ pytest tests/ -v
 ## Relationship to worldcereal-classification
 
 ```
-worldcereal-classification  (main branch — install this first)
+worldcereal-classification  (main branch : install this first)
 │
 │   provides:
 │     • worldcereal.train.datasets.WorldCerealTrainingDataset
@@ -249,7 +250,7 @@ worldcereal-classification  (main branch — install this first)
 │     • worldcereal.utils.timeseries.process_parquet
 │     • worldcereal.utils.sharepoint.*
 │
-└── outlier_embeddings  (this repo — install on top)
+└── outlier_embeddings  (this repo : install on top)
       provides:
         • Presto embeddings cache (DuckDB)
         • Embedding-space outlier scoring pipeline
