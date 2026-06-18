@@ -1,0 +1,74 @@
+# =====================================================================
+# Experiment grid for "outlier removal from embeddings" — edit paths and
+# enumerations to match your HPC layout, then expand into a SLURM array.
+# Consumed by slurm/finetune_array.slurm (via expand_grid.py-style indexing)
+# and as documentation for run_catboost_proxy.py / run_worldcereal_finetune.py.
+# =====================================================================
+
+paths:
+  # Long/wide training parquet that already has the 6 anomaly columns written
+  # back by scripts/compute_anomaly_scores.py, plus a region column, a quality
+  # column, and a fixed 'split' column (train/test).
+  scored_parquet: /projects/worldcereal/data/training_with_anomaly.parquet
+  embeddings_db:  /projects/worldcereal/data/cached_embeddings/embeddings_cache_LANDCOVER10_geo.duckdb
+  output_root:    /projects/worldcereal/experiments/outliers
+  presto_vanilla:   /models/presto/presto_vanilla.pt          # un-fine-tuned encoder
+  presto_finetuned: /models/presto/presto_worldcereal_ft.pt   # fine-tuned encoder (Tier-2 only)
+
+columns:
+  label_col: downstream_class
+  region_col: region
+  group_col: ref_id                 # leakage-safe split grouping (proxy)
+  quality_col: quality_score_ct
+  # crop-type domain anomaly columns (use LC10_* for the landcover task)
+  flag_col: CTY24_anomaly_flag
+  conf_col: CTY24_confidence_nonoutlier
+  split_column: split
+
+# Axes of the grid -----------------------------------------------------
+encoders: [vanilla, finetuned]      # the headline comparison for this paper
+
+regions:                            # macro-regions used by create_balanced_splits.py
+  - ALL
+  - Europe
+  - Africa
+  - Americas
+  - Asia
+
+scenarios:                          # names must match experiments/scenarios.py
+  - baseline
+  - drop_candidate
+  - drop_suspect
+  - drop_flagged
+  - downweight_linear
+  - downweight_power2
+  - downweight_power4
+  - filter_conf_0.90
+  - filter_conf_0.95
+  - drop_suspect+downweight
+
+test_views: [clean, full, minus_flagged]   # reported for every cell
+
+seeds: [0, 1, 2]
+
+# Fast-tier (CatBoost proxy) knobs ------------------------------------
+proxy:
+  test_frac: 0.2
+  quality_threshold: 0.9
+  min_class_count: 20
+
+# Slow-tier (WorldCereal fine-tuning) knobs ---------------------------
+finetune:
+  head_task: croptype
+  head_type: mlp
+  season_id: tc-s1
+  epochs: 50
+  batch_size: 1024
+  lr: 0.01
+  num_workers: 8
+
+# Intrinsic detector validation (synthetic noise) --------------------
+validation:
+  noise_modes: [within_context, random, parcel]
+  noise_rates: [0.02, 0.05, 0.10, 0.20]
+  seeds: [0, 1, 2]
