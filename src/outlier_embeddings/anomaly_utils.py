@@ -111,8 +111,8 @@ def _cosine_distance_matrix(embeddings: np.ndarray) -> np.ndarray:
 def robust_centroid(
     embeddings: np.ndarray,
     mode: str = "trimmed",
-    trim_frac: float = 0.10,
-    n_iter: int = 1,
+    trim_frac: float = 0.05,
+    n_iter: int = 2,
 ) -> np.ndarray:
     """Compute a centroid that resists contamination by the very outliers we
     are trying to detect.
