@@ -186,6 +186,4 @@ rather than forced:
 # unit tests (incl. the new robustness/validation/scenario tests)
 cd outlier_embeddings && PYTHONPATH=src python3 -m pytest tests/ -q   # 72 passed
 
-# paper compiles to an 8-page PDF
-cd Paper/Outliers_from_Embeddings/WACV_Embeddings && latexmk -pdf main.tex
 ```
