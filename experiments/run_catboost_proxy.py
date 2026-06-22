@@ -29,6 +29,13 @@ python run_catboost_proxy.py \
     --region-col region --quality-col quality_score_ct \
     --group-col ref_id --seeds 0 1 2 \
     --out-csv results/proxy_results.csv
+
+Or, against the real split artefacts (DuckDB embeddings + merged outlier parquet):
+
+python run_catboost_proxy.py \
+    --duckdb embeddings_cache.duckdb --merged-parquet merged_LC10_CTY24_flagged.parquet \
+    --domain CTY24 --group-col ref_id --seeds 0 1 2 \
+    --out-csv results/proxy_results.csv
 """
 
 from __future__ import annotations
@@ -212,10 +219,23 @@ def aggregate(results: pd.DataFrame) -> pd.DataFrame:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--scored-parquet", required=True, type=Path)
-    p.add_argument("--label-col", required=True)
-    p.add_argument("--flag-col", required=True)
-    p.add_argument("--conf-col", required=True)
+    # --- Source A: a single pre-scored parquet (legacy / combined artefact) ---
+    p.add_argument("--scored-parquet", type=Path, default=None,
+                   help="Single parquet with embeddings + label/flag/conf columns.")
+    # --- Source B: real split artefacts (DuckDB embeddings + merged outlier parquet) ---
+    p.add_argument("--duckdb", type=Path, default=None,
+                   help="embeddings_cache DuckDB; joined to --merged-parquet on sample_id.")
+    p.add_argument("--merged-parquet", type=Path, default=None,
+                   help="Merged outlier parquet (outlier_{domain}_cls etc.).")
+    p.add_argument("--domain", default="CTY24", choices=["CTY24", "LC10"],
+                   help="Which label/flag/conf family to use from the merged parquet.")
+    p.add_argument("--model-hash", default=None, help="Filter embeddings by model_hash.")
+    p.add_argument("--ref-ids", nargs="+", default=None, help="Restrict to these ref_id values.")
+    p.add_argument("--max-rows", type=int, default=None, help="Sub-sample N embedding rows.")
+    # Column overrides (auto-filled from the loader when --duckdb is used) ----
+    p.add_argument("--label-col", default=None)
+    p.add_argument("--flag-col", default=None)
+    p.add_argument("--conf-col", default=None)
     p.add_argument("--region-col", default=None)
     p.add_argument("--quality-col", default=None)
     p.add_argument("--group-col", default=None,
@@ -227,15 +247,39 @@ def main() -> None:
     p.add_argument("--out-csv", required=True, type=Path)
     args = p.parse_args()
 
-    df = pd.read_parquet(args.scored_parquet)
-    print(f"[proxy] loaded {len(df):,} rows from {args.scored_parquet}")
+    label_col, flag_col, conf_col = args.label_col, args.flag_col, args.conf_col
+    region_col = args.region_col
+    if args.duckdb is not None:
+        if args.merged_parquet is None:
+            p.error("--duckdb requires --merged-parquet")
+        from data_loader import load_unified
+        df, names = load_unified(
+            args.duckdb, args.merged_parquet,
+            domain=args.domain, model_hash=args.model_hash,
+            ref_ids=args.ref_ids, region_parquet=None,
+            quality_parquet=None, max_rows=args.max_rows,
+        )
+        # Loader names win unless the user explicitly overrode them.
+        label_col = label_col or names["label_col"]
+        flag_col = flag_col or names["flag_col"]
+        conf_col = conf_col or names["conf_col"]
+        region_col = region_col or names.get("region_col")
+        print(f"[proxy] loaded {len(df):,} rows via DuckDB+merged "
+              f"(domain={args.domain}, label={label_col})")
+    elif args.scored_parquet is not None:
+        df = pd.read_parquet(args.scored_parquet)
+        print(f"[proxy] loaded {len(df):,} rows from {args.scored_parquet}")
+    else:
+        p.error("provide either --scored-parquet or (--duckdb and --merged-parquet)")
+    if not (label_col and flag_col and conf_col):
+        p.error("label/flag/conf columns must be set (via args or the loader)")
 
     results = run(
         df,
-        label_col=args.label_col,
-        flag_col=args.flag_col,
-        conf_col=args.conf_col,
-        region_col=args.region_col,
+        label_col=label_col,
+        flag_col=flag_col,
+        conf_col=conf_col,
+        region_col=region_col,
         quality_col=args.quality_col,
         group_col=args.group_col,
         seeds=args.seeds,

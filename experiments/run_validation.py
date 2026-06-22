@@ -32,8 +32,19 @@ from outlier_embeddings.validation import sweep  # noqa: E402
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--parquet", required=True, type=Path)
-    p.add_argument("--label-col", required=True)
+    # --- Source A: an embeddings parquet with a vector "embedding" column ----
+    p.add_argument("--parquet", type=Path, default=None)
+    # --- Source B: real split artefacts (DuckDB + merged outlier parquet) ----
+    p.add_argument("--duckdb", type=Path, default=None,
+                   help="embeddings_cache DuckDB; joined to --merged-parquet on sample_id.")
+    p.add_argument("--merged-parquet", type=Path, default=None,
+                   help="Merged outlier parquet (provides the clean label column).")
+    p.add_argument("--domain", default="CTY24", choices=["CTY24", "LC10"],
+                   help="Which label family to treat as the clean ground-truth label.")
+    p.add_argument("--model-hash", default=None, help="Filter embeddings by model_hash.")
+    p.add_argument("--ref-ids", nargs="+", default=None, help="Restrict to these ref_id values.")
+    p.add_argument("--max-rows", type=int, default=None, help="Sub-sample N embedding rows.")
+    p.add_argument("--label-col", default=None)
     p.add_argument("--h3-col", default="h3_l3_cell")
     p.add_argument("--group-col", default=None, help="Parcel/field id (enables parcel-noise mode).")
     p.add_argument("--modes", nargs="+", default=["within_context", "random", "parcel"])
@@ -43,17 +54,41 @@ def main() -> None:
     p.add_argument("--out-csv", required=True, type=Path)
     args = p.parse_args()
 
-    df = pd.read_parquet(args.parquet)
-    print(f"[validation] loaded {len(df):,} rows")
+    label_col, h3_col, group_col = args.label_col, args.h3_col, args.group_col
+    if args.duckdb is not None:
+        if args.merged_parquet is None:
+            p.error("--duckdb requires --merged-parquet")
+        import numpy as np
+        from data_loader import load_unified
+        df, names = load_unified(
+            args.duckdb, args.merged_parquet,
+            domain=args.domain, model_hash=args.model_hash,
+            ref_ids=args.ref_ids, region_parquet=None,
+            quality_parquet=None, max_rows=args.max_rows,
+        )
+        label_col = label_col or names["label_col"]
+        h3_col = names["h3_col"]
+        group_col = group_col or names["group_col"]
+        embed_cols = names["embed_cols"]
+        df["embedding"] = list(df[embed_cols].to_numpy(dtype=np.float32))
+        print(f"[validation] loaded {len(df):,} rows via DuckDB+merged "
+              f"(domain={args.domain}, label={label_col}, dim={len(embed_cols)})")
+    elif args.parquet is not None:
+        df = pd.read_parquet(args.parquet)
+        print(f"[validation] loaded {len(df):,} rows")
+    else:
+        p.error("provide either --parquet or (--duckdb and --merged-parquet)")
+    if not label_col:
+        p.error("--label-col must be set (via args or the loader)")
 
     res = sweep(
         df,
         modes=tuple(args.modes),
         rates=tuple(args.rates),
         seeds=tuple(args.seeds),
-        label_col=args.label_col,
-        h3_col=args.h3_col,
-        group_col=args.group_col,
+        label_col=label_col,
+        h3_col=h3_col,
+        group_col=group_col,
         score_col=args.score_col,
     )
     args.out_csv.parent.mkdir(parents=True, exist_ok=True)
