@@ -172,16 +172,16 @@ def score_embeddings_df(
     group_cols: Sequence[str] = (),
     embedding_col: str = "embedding",
     threshold_mode: str = "mad",
-    mad_k: float = 3.0,
+    mad_k: float = 4.0,
     percentile_q: float = 0.96,
-    max_flagged_fraction: Optional[float] = 0.10,
+    max_flagged_fraction: Optional[float] = None,
     norm_percentiles: Tuple[float, float] = (2.0, 98.0),
     centroid_mode: str = "trimmed",
-    centroid_trim: float = 0.10,
+    centroid_trim: float = 0.05,
     max_full_pairwise_n: Optional[int] = 0,
     gate_confidence_by_flag: bool = True,
-    apply_slice_trust: bool = True,
-    slice_trust_min: float = 0.30,
+    apply_slice_trust: bool = False,
+    slice_trust_min: float = 0.05,
 ) -> pd.DataFrame:
     """Run the core scoring → flag → confidence → trust chain on a pre-loaded
     embeddings DataFrame.

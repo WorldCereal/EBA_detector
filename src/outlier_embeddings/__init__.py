@@ -26,7 +26,10 @@ Typical usage
 ...     embeddings_db_path="/path/to/embeddings_cache.duckdb",
 ...     h3_level=[2, 3],
 ...     threshold_mode="mad",
-...     mad_k=3.0,
+...     mad_k=4.0,
+...     centroid_mode="trimmed", centroid_trim=0.05,
+...     gate_confidence_by_flag=True,
+...     apply_slice_trust=False, slice_trust_min=0.05,
 ...     output_samples_path="/path/to/output_scores.parquet",
 ... )
 """
