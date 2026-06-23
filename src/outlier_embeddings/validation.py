@@ -237,6 +237,10 @@ def score_embeddings_df(
         scored["slice_n"] = len(g)
         results.append(scored)
     scored_df = pd.concat(results, ignore_index=True)
+    # Rows in slices too small to define a centroid are never scored by the
+    # production pipeline (they keep confidence 1.0); mark them so detection
+    # metrics can be restricted to the population the detector operates on.
+    scored_df["scored"] = scored_df["slice_n"] >= MIN_SCORING_SLICE_SIZE
 
     # 3. flagging
     flagged_df, _summary = flag_anomalies(
@@ -287,9 +291,11 @@ def evaluate_detection(
     scored_df: pd.DataFrame,
     *,
     truth_col: str = "noise_truth",
-    score_col: str = "S",
+    score_col: str = "mean_score",
     flag_col: str = "flagged",
     k_list: Sequence[float] = (0.01, 0.05, 0.10),
+    restrict_to_scored: bool = True,
+    scored_col: str = "scored",
 ) -> Dict[str, float]:
     """Score how well the detector recovers the injected corruptions.
 
@@ -308,6 +314,13 @@ def evaluate_detection(
         average_precision_score,
         roc_auc_score,
     )
+
+    # Restrict to the population the detector can actually score: points in
+    # slices too small to define a centroid are never assigned a score in
+    # production (they keep confidence 1.0), so counting them as missed
+    # detections would unfairly deflate ranking metrics.
+    if restrict_to_scored and scored_col in scored_df.columns:
+        scored_df = scored_df[scored_df[scored_col].fillna(False).astype(bool)]
 
     y = scored_df[truth_col].fillna(False).to_numpy(dtype=bool)
     s = pd.to_numeric(scored_df[score_col], errors="coerce").fillna(0.0).to_numpy()
@@ -366,7 +379,7 @@ def run_noise_experiment(
     *,
     score_kwargs: Optional[dict] = None,
     eval_kwargs: Optional[dict] = None,
-    score_col: str = "S",
+    score_col: str = "mean_score",
 ) -> Dict[str, float]:
     """Inject noise → score on the noisy labels → evaluate recovery.
 
@@ -410,16 +423,19 @@ def sweep(
     h3_col: str = "h3_l3_cell",
     group_col: Optional[str] = None,
     score_kwargs: Optional[dict] = None,
-    score_col: str = "S",
+    score_col: str = "mean_score",
 ) -> pd.DataFrame:
     """Sweep noise modes × rates × seeds and return a tidy results DataFrame
     (one row per run) ready for aggregation / plotting in the paper."""
     rows: List[Dict[str, float]] = []
     for mode in modes:
+        print(f"Running mode: {mode}")
         if mode in ("group", "parcel") and not group_col:
             continue
         for rate in rates:
+            print(f"  Running rate: {rate}")
             for seed in seeds:
+                print(f"    Running seed: {seed}")
                 spec = NoiseSpec(
                     mode=mode, rate=rate, label_col=label_col,
                     h3_col=h3_col, group_col=group_col, seed=seed,

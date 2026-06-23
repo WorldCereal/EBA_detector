@@ -50,7 +50,9 @@ def main() -> None:
     p.add_argument("--modes", nargs="+", default=["within_context", "random", "parcel"])
     p.add_argument("--rates", type=float, nargs="+", default=[0.02, 0.05, 0.10, 0.20])
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
-    p.add_argument("--score-col", default="S", choices=["S", "mean_score"])
+    p.add_argument("--score-col", default="mean_score", choices=["S", "mean_score"],
+                   help="Detector ranking score. mean_score is what the shipped "
+                        "confidence_nonoutlier is built from; S is the raw distance.")
     p.add_argument("--out-csv", required=True, type=Path)
     args = p.parse_args()
 
