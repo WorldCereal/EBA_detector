@@ -347,8 +347,15 @@ def evaluate_detection(
         topk = max(1, int(round(k * n)))
         sel = y_sorted[:topk]
         tp = int(sel.sum())
-        out[f"precision_at_{k:g}"] = float(tp / topk)
+        prec_k = tp / topk
+        out[f"precision_at_{k:g}"] = float(prec_k)
         out[f"recall_at_{k:g}"] = float(tp / n_corrupt) if n_corrupt else float("nan")
+        # Enrichment = how many times above the base rate planted errors are
+        # concentrated in the top-k by score; >1 means the detector ranks them
+        # above chance even when global AUROC is uninformative for this
+        # per-slice, tail-gated detector.
+        base = out["base_rate"]
+        out[f"lift_at_{k:g}"] = float(prec_k / base) if base else float("nan")
 
     if flag_col in scored_df.columns:
         f = scored_df[flag_col].fillna(False).to_numpy(dtype=bool)
@@ -359,6 +366,7 @@ def evaluate_detection(
         rec = tp / (tp + fn) if (tp + fn) else float("nan")
         out["flag_precision"] = float(prec)
         out["flag_recall"] = float(rec)
+        out["flag_enrichment"] = float(prec / out["base_rate"]) if out["base_rate"] else float("nan")
         if prec and rec and np.isfinite(prec) and np.isfinite(rec) and (prec + rec) > 0:
             out["flag_f1"] = float(2 * prec * rec / (prec + rec))
         else:
