@@ -57,9 +57,14 @@ notebooks = [
     "folium",
 ]
 
+# Google Earth Engine — for extract_alphaearth_embeddings.py
+gee = [
+    "earthengine-api>=1.7.28",
+]
+
 # Everything
 all = [
-    "outlier_embeddings[experiments,sharepoint,notebooks]",
+    "outlier_embeddings[experiments,sharepoint,notebooks,gee]",
 ]
 
 # Test dependencies

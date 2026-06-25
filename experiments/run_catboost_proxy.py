@@ -126,6 +126,7 @@ def run(
             continue
 
         for seed in seeds:
+            print(f"Running seed: {seed}")
             split_df = _make_fixed_split(
                 sub, group_col=group_col, test_frac=test_frac, seed=seed
             )
@@ -148,6 +149,7 @@ def run(
                 continue
 
             for scen in scenarios:
+                print(f"  Running scenario: {scen.name}")
                 tr = apply_scenario_to_train(
                     train_full, scen, flag_col=flag_col, conf_col=conf_col
                 )
