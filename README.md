@@ -1,13 +1,11 @@
-# outlier_embeddings <!-- omit in toc -->
-Refactored from the `outliers-from-embeddings` branch of `worldcereal-classification` into a standalone package for better modularity and maintainability.
-
-A companion package to [WorldCereal classification](https://github.com/WorldCereal/worldcereal-classification) that detects anomalous / potentially mislabelled samples in WorldCereal reference datasets by operating directly on pre-computed **Presto embedding vectors**.
+# EBA Detector <!-- omit in toc -->
+A package that detects anomalous / potentially mislabelled samples in croptype reference datasets such as from worldcereal by operating directly on pre-computed **embedding vectors**.
 
 ---
 
 ## Overview
 
-The WorldCereal training pipeline produces Presto embeddings for every reference sample.
+The geospatial foundation model training pipeline produces embeddings for every reference sample.
 This package provides a self-contained pipeline that:
 
 1. **Loads** embeddings from a DuckDB cache (built once, updated incrementally).
