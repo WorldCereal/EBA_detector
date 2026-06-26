@@ -29,12 +29,12 @@ TEST_FRAC=0.2
 
 # ------------------------------------------------------------------ PATHS / ENV
 # Directory that contains run_catboost_proxy.py + data_loader.py (this repo).
-PROXY_DIR=/home/vito/shahs/TestFolder/All_repos/outliers_embeddings/experiments  # <-- set to your checkout
-DUCKDB=/home/vito/shahs/TestFolder/wc_outliers/data_for_outlier/EMBEDDINGS_CACHE/embeddings_cache_LANDCOVER10_updated_new_model.duckdb
-MERGED_DIR_normal=/projects/worldcereal/data/cached_wide_merged/Region_wise_files_newmodel
-MERGED_DIR_sharper=/projects/worldcereal/data/cached_wide_merged/Region_wise_files_newmodel_sharper
-OUTROOT=/home/vito/shahs/TestFolder/wc_outliers/data_for_outlier
-LOGDIR=/home/vito/shahs/logs/WCProxyNewModel
+PROXY_DIR=/path/to/outliers_embeddings/experiments  # <-- set to your checkout
+DUCKDB=/path/to/embeddings_cache.duckdb
+MERGED_DIR_normal=/path/to/data/Region_wise_files
+MERGED_DIR_sharper=/path/to/data/Region_wise_files_sharper
+OUTROOT=/path/to/output
+LOGDIR=/path/to/logs/proxy
 CONDA_ENV=worldcereal-py311        # must have: catboost duckdb pandas pyarrow scikit-learn
 PARTITION=batch                      # CatBoost on 128-d embeddings is fast on CPU; set to your CPU partition
 CPUS=16

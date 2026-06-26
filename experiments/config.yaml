@@ -9,9 +9,9 @@ paths:
   # Long/wide training parquet that already has the 6 anomaly columns written
   # back by scripts/compute_anomaly_scores.py, plus a region column, a quality
   # column, and a fixed 'split' column (train/test).
-  scored_parquet: /projects/worldcereal/data/training_with_anomaly.parquet
-  embeddings_db:  /projects/worldcereal/data/cached_embeddings/embeddings_cache_LANDCOVER10_geo.duckdb
-  output_root:    /projects/worldcereal/experiments/outliers
+  scored_parquet: /data/worldcereal/training_with_anomaly.parquet
+  embeddings_db:  /data/worldcereal/embeddings_cache.duckdb
+  output_root:    /data/worldcereal/experiments/outliers
   presto_vanilla:   /models/presto/presto_vanilla.pt          # un-fine-tuned encoder
   presto_finetuned: /models/presto/presto_worldcereal_ft.pt   # fine-tuned encoder (Tier-2 only)
 

@@ -15,7 +15,6 @@ tensor bytes) segments embeddings per model variant.
 """
 
 import hashlib
-import sys
 from pathlib import Path
 from typing import Iterable, List, Optional, Set
 
@@ -410,28 +409,3 @@ def compute_embeddings(
     out_df["embedding"] = ordered_embeddings
     logger.info("Ordered embeddings to match input dataframe.")
     return out_df
-
-
-if __name__ == "__main__":
-    cached_parquet = Path(
-        "/projects/worldcereal/data/cached_wide_parquets/worldcereal_all_extractions_wide_month_LANDCOVER10.parquet"
-    )
-    model_url = "https://artifactory.vgt.vito.be/artifactory/auxdata-public/worldcereal/models/PhaseII/presto-ss-wc_longparquet_random-window-cut_no-time-token_epoch96.pt"
-
-    logger.remove()
-    logger.add(sys.stderr, level="INFO")
-
-    target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {target_device}")
-    model = Presto(pretrained_model_path=model_url)
-    model.eval().to(target_device)
-    embeddings_tag = "LANDCOVER10"
-
-    compute_embeddings(
-        pd.read_parquet(cached_parquet),
-        model=model,
-        batch_size=8192,
-        num_workers=7,
-        embeddings_db_path=f"/projects/worldcereal/data/cached_embeddings/embeddings_cache_{embeddings_tag}.duckdb",
-        force_recompute=False,
-    )

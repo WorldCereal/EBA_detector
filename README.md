@@ -1,7 +1,7 @@
 # outlier_embeddings <!-- omit in toc -->
 Refactored from the `outliers-from-embeddings` branch of `worldcereal-classification` into a standalone package for better modularity and maintainability.
 
-A private companion package to [WorldCereal classification](https://github.com/WorldCereal/worldcereal-classification) that detects anomalous / potentially mislabelled samples in WorldCereal reference datasets by operating directly on pre-computed **Presto embedding vectors**.
+A companion package to [WorldCereal classification](https://github.com/WorldCereal/worldcereal-classification) that detects anomalous / potentially mislabelled samples in WorldCereal reference datasets by operating directly on pre-computed **Presto embedding vectors**.
 
 ---
 
@@ -259,9 +259,7 @@ worldcereal-classification  (main branch : install this first)
         • CLI script + interactive notebooks
 ```
 
-The branch `outliers-from-embeddings` of `worldcereal-classification` contains the integration
-history (earlier exploratory versions of these modules). Going forward, all outlier-specific
-development happens in this repo; `worldcereal-classification` stays on `main`.
+All outlier-specific development happens in this repo; `worldcereal-classification` provides the foundational utilities.
 
 ---
 

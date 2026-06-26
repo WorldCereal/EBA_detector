@@ -34,83 +34,44 @@ Example usage
 # Full rerun (derive all paths from --input-long-dir and --suffix):
 python compute_anomaly_scores.py \\
     --mode rerun \\
-    --input-long-dir /projects/worldcereal/data/worldcereal_all_extractions.parquet
+    --input-long-dir /data/worldcereal_extractions.parquet
 
 # Incremental update (new datasets added, same embeddings DB):
 python compute_anomaly_scores.py \\
     --mode update \\
-    --input-long-dir /projects/worldcereal/data/worldcereal_all_extractions.parquet \\
-    --output-long-dir /projects/worldcereal/data/worldcereal_all_extractions_with_anomalies.parquet \\
-    --embeddings-db-path /projects/worldcereal/data/cached_embeddings/embeddings_cache.duckdb \\
+    --input-long-dir /data/worldcereal_extractions.parquet \\
+    --output-long-dir /data/worldcereal_extractions_with_anomalies.parquet \\
+    --embeddings-db-path /data/embeddings_cache.duckdb \\
     --class-mappings-json /path/to/class_mappings.json
 
+# geoparquet mode (in-place update of flat .geoparquet files):
 python compute_anomaly_scores.py \\
---mode update \\
---input-format geoparquet \\
---input-long-dir /data/worldcereal_data/EXTRACTIONS/WORLDCEREAL/MERGED_PARQUETS_PHASEII_WITH_ANOMALY \\
---embeddings-db-path /data/worldcereal_data/EXTRACTIONS/WORLDCEREAL/EMBEDDINGS_CACHE/embeddings_cache_LANDCOVER10_updated.duckdb \\
---wide-dir /data/worldcereal_data/EXTRACTIONS/WORLDCEREAL/CACHED_WIDE_MERGED/cached_wide_merged/cached_wide_parquets \\
---merged-wide-path /data/worldcereal_data/EXTRACTIONS/WORLDCEREAL/CACHED_WIDE_MERGED/cached_wide_merged/worldcereal_all_extractions_wide_month.parquet \\
---sp-env-file /home/wcextractions/.sharepointenv 
+    --mode update \\
+    --input-format geoparquet \\
+    --input-long-dir /data/MERGED_PARQUETS \\
+    --embeddings-db-path /data/embeddings_cache.duckdb \\
+    --wide-dir /data/cached_wide_parquets \\
+    --merged-wide-path /data/worldcereal_wide.parquet \\
+    --class-mappings-json /path/to/class_mappings.json
 
-python compute_anomaly_scores.py \
---mode rerun \
---input-format parquet \
---input-long-dir /home/wcextractions/Public/Rosh_temp_work/MOZ_outliers \
---embeddings-db-path /home/wcextractions/Public/Rosh_temp_work/MOZ_outliers/embeddings_cache_LANDCOVER10_updated.duckdb \
---wide-dir /home/wcextractions/Public/Rosh_temp_work/MOZ_outliers/cached_wide_parquets \
---merged-wide-path //home/wcextractions/Public/Rosh_temp_work/MOZ_outliers/MOZ_wide_month.parquet \
---compute_h3_levels h3_levels \
---sp-env-file /home/wcextractions/.sharepointenv \
---lc10-h3-levels 2 \
---lc10-min-slice-size 100 \
---lc10-mad-k 3.0 \
---cty24-h3-levels 2 \
---cty24-min-slice-size 100 \
---cty24-mad-k 3.0 \
-    
-
-python compute_anomaly_scores.py --mode rerun \
-    --input-format geoparquet \
-    --input-long-dir /data/worldcereal_data/EXTRACTIONS/WORLDCEREAL/MERGED_PARQUETS_PHASEII \
-    --embeddings-db-path /data/worldcereal_data/EXTRACTIONS/WORLDCEREAL/EMBEDDINGS_CACHE/embeddings_cache_LANDCOVER10_updated.duckdb \
-    --wide-dir /data/worldcereal_data/EXTRACTIONS/WORLDCEREAL/CACHED_WIDE_MERGED\
-    --merged-wide-path //home/wcextractions/Public/Rosh_temp_work/combined_MOZ_outliers/combined_MOZ_wide_month1.parquet \
-    --compute_h3_levels h3_levels \
-    --class-mappings-json /vitodata/worldcereal/data/COP4GEOGLAM/mozambique_pm/class_mappings_mozambique_new.json \
-    --lc10-h3-levels 1 \
-    --lc10-min-slice-size 50 \
-    --lc10-mad-k 3.0 \
-    --cty24-h3-levels 1 \
-    --cty24-min-slice-size 50 \
-    --cty24-mad-k 3.0 \
-    --lc10-class-mapping LANDCOVER10 \
-    --cty24-class-mapping CROPTYPE_Mozambique \
+# Custom crop-type domain (e.g. for a regional study):
+python compute_anomaly_scores.py --mode rerun \\
+    --input-format geoparquet \\
+    --input-long-dir /data/MERGED_PARQUETS \\
+    --embeddings-db-path /data/embeddings_cache.duckdb \\
+    --wide-dir /data/cached_wide_parquets \\
+    --merged-wide-path /data/worldcereal_wide.parquet \\
+    --class-mappings-json /path/to/class_mappings.json \\
+    --lc10-class-mapping LANDCOVER10 \\
+    --lc10-h3-levels 1 --lc10-min-slice-size 50 --lc10-mad-k 3.0 \\
+    --cty24-class-mapping CROPTYPE_Custom \\
+    --cty24-h3-levels 1 --cty24-min-slice-size 50 --cty24-mad-k 3.0 \\
     --overwrite-scores --overwrite-merged-scores
-
-    
-    
-python compute_anomaly_scores.py \
-  --mode rerun \
-  --input-format parquet \
-  --input-long-dir /home/wcextractions/Public/Rosh_temp_work/MOZ_outliers \
-  --embeddings-db-path /home/wcextractions/Public/Rosh_temp_work/MOZ_outliers/embeddings_cache_LANDCOVER10_updated.duckdb \
-  --wide-dir /home/wcextractions/Public/Rosh_temp_work/MOZ_outliers/cached_wide_parquets \
-  --merged-wide-path /home/wcextractions/Public/Rosh_temp_work/MOZ_outliers/MOZ_wide_month.parquet \
-  --compute h3_levels \
-  --class-mappings-json /vitodata/worldcereal/data/COP4GEOGLAM/mozambique_pm/class_mappings_mozambique_new.json \
-  --lc10-class-mapping LANDCOVER10 \
-  --lc10-h3-levels 2 --lc10-min-slice-size 100 --lc10-mad-k 3.0 \
-  --cty24-class-mapping CROPTYPE_Mozambique \
-  --cty24-h3-levels 2 --cty24-min-slice-size 100 --cty24-mad-k 3.0
-
-    
-    
 
 # Skip the heavy embeddings rebuild and re-score only:
 python compute_anomaly_scores.py --mode rerun --skip-embeddings \\
-    --embeddings-db-path /data/.../embeddings_cache.duckdb \\
-    --class-mappings-json /data/.../class_mappings.json
+    --embeddings-db-path /data/embeddings_cache.duckdb \\
+    --class-mappings-json /data/class_mappings.json
 """
 
 from __future__ import annotations
@@ -191,10 +152,11 @@ from worldcereal.utils.timeseries import process_parquet  # noqa: E402
 # Default Presto checkpoint
 # ---------------------------------------------------------------------------
 
-_DEFAULT_PRESTO_URL = (
-    "https://artifactory.vgt.vito.be/artifactory/auxdata-public/worldcereal/models/"
-    "PhaseII/presto-ss-wc_longparquet_random-window-cut_no-time-token_epoch96.pt"
-)
+# Path or URL to the Presto model checkpoint used for embedding extraction.
+# Set via --presto-url-or-path on the CLI, or replace this default.
+# The model weights are distributed with the prometheo package / WorldCereal
+# model repository.  Provide a local file path or a direct download URL.
+_DEFAULT_PRESTO_URL = ""  # configure via --presto-url-or-path
 
 
 # ===========================================================================
@@ -1698,12 +1660,6 @@ def _parse_max_timesteps_trim(v: str) -> int | str | None:
 
 
 def _default_input_dir() -> Path | None:
-    for c in [
-        Path("/home/vito/shahs/projects/worldcereal/data/worldcereal_all_extractions.parquet"),
-        Path("/projects/worldcereal/data/worldcereal_all_extractions.parquet"),
-    ]:
-        if c.exists():
-            return c
     return None
 
 
@@ -1737,7 +1693,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["parquet", "geoparquet"],
         default="parquet",
         help=(
-            "'parquet' (default): nested hive-partitioned .parquet dataset (HPC layout). "
+            "'parquet' (default): nested hive-partitioned .parquet dataset (cluster layout). "
             "'geoparquet': flat folder of per-dataset .geoparquet files (VM layout). "
             "In 'geoparquet' mode scores are written back IN-PLACE, the output long dir "
             "defaults to the same as the input, and geo metadata is preserved."
