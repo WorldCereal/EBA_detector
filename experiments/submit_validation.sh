@@ -28,7 +28,7 @@ SEEDS="0 1 2"
 # ----------------------------------------------------------------------------
 
 # ------------------------------------------------------------------ PATHS / ENV
-PROXY_DIR=/home/vito/shahs/TestFolder/wc_outliers/outliers_embeddings/experiments   # <-- set to your checkout
+PROXY_DIR=/home/vito/shahs/TestFolder/wc_outliers/EBA_detector/experiments   # <-- set to your checkout
 DUCKDB=/projects/worldcereal/data/cached_embeddings/embeddings_cache_LANDCOVER10_updated_new.duckdb
 MERGED_DIR_normal=/projects/worldcereal/data/cached_wide_merged/Region_wise_files
 MERGED_DIR_sharper=/projects/worldcereal/data/cached_wide_merged/Region_wise_files_sharper

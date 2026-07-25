@@ -26,7 +26,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from outlier_embeddings.validation import sweep  # noqa: E402
+from EBA_detector.validation import sweep  # noqa: E402
 
 
 def main() -> None:

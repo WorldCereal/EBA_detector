@@ -21,7 +21,7 @@ Design rules that keep the experiments honest
    three separates "the model got better" from "the test set got easier".
 
 The anomaly columns produced by the pipeline (see
-``outlier_embeddings.anomaly_utils.ANOMALY_COLUMNS`` and
+``EBA_detector.anomaly_utils.ANOMALY_COLUMNS`` and
 ``worldcereal.train.OUTLIER_COLUMNS``) are:
 
 * ``*_anomaly_flag``           : ``normal|flagged|suspect|candidate``

@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "outlier_embeddings"
+name = "EBA_detector"
 version = "0.1.0"
 description = "Embedding-based outlier scoring for WorldCereal reference data"
 readme = "README.md"
@@ -64,7 +64,7 @@ gee = [
 
 # Everything
 all = [
-    "outlier_embeddings[experiments,sharepoint,notebooks,gee]",
+    "EBA_detector[experiments,sharepoint,notebooks,gee]",
 ]
 
 # Test dependencies
@@ -76,7 +76,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/outlier_embeddings"]
+packages = ["src/EBA_detector"]
 
 [tool.hatch.build.targets.sdist]
 include = [

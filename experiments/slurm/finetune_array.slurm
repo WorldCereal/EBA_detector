@@ -16,7 +16,7 @@ mkdir -p logs
 
 module load Python 2>/dev/null || true
 source "${OUTLIER_VENV:-$HOME/venvs/worldcereal}/bin/activate"
-REPO="${OUTLIER_REPO:-$HOME/outlier_embeddings}"
+REPO="${OUTLIER_REPO:-$HOME/EBA_detector}"
 cd "$REPO/experiments"
 
 # --- grid axes (keep in sync with config.yaml) ----------------------

@@ -38,7 +38,7 @@ publish:
    should be left disabled for the standard one-centroid-per-field setup.
 
 All functions are stateless and operate on the same per-slice DataFrame /
-embedding conventions as :mod:`outlier_embeddings.anomaly_utils`.
+embedding conventions as :mod:`EBA_detector.anomaly_utils`.
 """
 
 from __future__ import annotations

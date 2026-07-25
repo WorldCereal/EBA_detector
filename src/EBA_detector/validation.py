@@ -28,8 +28,8 @@ Pipeline
 
 2. :func:`score_embeddings_df` — a self-contained driver that runs the core
    scoring → flagging → confidence → (optional) slice-trust chain from
-   :mod:`outlier_embeddings.anomaly_utils` and
-   :mod:`outlier_embeddings.robust_extensions` on the corrupted DataFrame.
+   :mod:`EBA_detector.anomaly_utils` and
+   :mod:`EBA_detector.robust_extensions` on the corrupted DataFrame.
 
 3. :func:`evaluate_detection` — score the recovery with detection AUROC,
    average precision (PR-AUC), precision@k / recall@k, and the realised
@@ -186,7 +186,7 @@ def score_embeddings_df(
     """Run the core scoring → flag → confidence → trust chain on a pre-loaded
     embeddings DataFrame.
 
-    This mirrors the heart of :func:`outlier_embeddings.anomaly.run_pipeline`
+    This mirrors the heart of :func:`EBA_detector.anomaly.run_pipeline`
     but skips the worldcereal-specific data loading and class-mapping layers,
     so it can be driven directly with controlled labels.  *df* must contain
     ``sample_id``, *label_col*, *h3_col*, and a vector *embedding_col*.

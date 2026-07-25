@@ -1,4 +1,4 @@
-"""outlier_embeddings — Embedding-based outlier scoring for WorldCereal reference data.
+"""EBA_detector — Embedding-based outlier scoring for WorldCereal reference data.
 
 This package provides a self-contained pipeline for detecting anomalous / mislabelled
 samples in WorldCereal reference datasets, operating entirely on pre-computed Presto
@@ -21,7 +21,7 @@ experiments
 
 Typical usage
 -------------
->>> from outlier_embeddings.anomaly import run_pipeline
+>>> from EBA_detector.anomaly import run_pipeline
 >>> flagged_gdf, summary_df = run_pipeline(
 ...     embeddings_db_path="/path/to/embeddings_cache.duckdb",
 ...     h3_level=[2, 3],
@@ -37,7 +37,7 @@ Typical usage
 from importlib.metadata import version, PackageNotFoundError
 
 try:
-    __version__ = version("outlier_embeddings")
+    __version__ = version("EBA_detector")
 except PackageNotFoundError:
     __version__ = "0.0.0+dev"
 

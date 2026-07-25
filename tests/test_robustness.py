@@ -16,20 +16,20 @@ import pytest
 # make experiments/ importable (sibling of src/)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments"))
 
-from outlier_embeddings.anomaly_utils import (
+from EBA_detector.anomaly_utils import (
     robust_centroid,
     compute_scores_for_slice,
     add_confidence_from_score,
     flag_anomalies,
 )
-from outlier_embeddings.robust_extensions import (
+from EBA_detector.robust_extensions import (
     compute_slice_trust,
     apply_trust_to_confidence,
     downgrade_flags_low_trust,
     parcel_aware_slice_scores,
     aggregate_parcel_scores,
 )
-from outlier_embeddings.validation import (
+from EBA_detector.validation import (
     NoiseSpec, inject_label_noise, score_embeddings_df, evaluate_detection,
 )
 

@@ -51,7 +51,7 @@ import pandas as pd
 # Allow running as a script from anywhere
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from outlier_embeddings.experiments import (  # noqa: E402
+from EBA_detector.experiments import (  # noqa: E402
     _extract_embeddings_matrix,
     _evaluate,
     _train_catboost_multiclass,

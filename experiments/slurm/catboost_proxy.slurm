@@ -15,7 +15,7 @@ mkdir -p logs results
 module load Python 2>/dev/null || true
 source "${OUTLIER_VENV:-$HOME/venvs/outliers}/bin/activate"
 
-REPO="${OUTLIER_REPO:-$HOME/outlier_embeddings}"
+REPO="${OUTLIER_REPO:-$HOME/EBA_detector}"
 cd "$REPO/experiments"
 
 # --- run the full scenario x region x seed grid (Tier-1) ------------

@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from outlier_embeddings.anomaly_utils import (
+from EBA_detector.anomaly_utils import (
     MIN_SCORING_SLICE_SIZE,
     _SCORE_COLS,
     _as_label_levels,
@@ -303,7 +303,7 @@ class TestComputeScoresForSlice:
         """Slices smaller than MIN_SCORING_SLICE_SIZE get all-zero scores."""
         df = _make_slice_df(n=MIN_SCORING_SLICE_SIZE - 1, n_outliers=0)
         # Use _score_group_simple which handles the small-slice case
-        from outlier_embeddings.anomaly_utils import _score_group_simple
+        from EBA_detector.anomaly_utils import _score_group_simple
 
         result = _score_group_simple(df, norm_percentiles=(5.0, 95.0), max_full_pairwise_n=None)
         for col in _SCORE_COLS:

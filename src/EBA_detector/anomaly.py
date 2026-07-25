@@ -39,9 +39,9 @@ import pandas as pd
 from worldcereal.utils.refdata import get_class_mappings, map_classes
 
 # All computation helpers live in anomaly_utils — import them here so that
-# any downstream code doing ``from outlier_embeddings.anomaly import <func>``
+# any downstream code doing ``from EBA_detector.anomaly import <func>``
 # continues to work.
-from outlier_embeddings.anomaly_utils import (
+from EBA_detector.anomaly_utils import (
     MIN_SCORING_SLICE_SIZE,
     _SCORE_COLS,
     ANOMALY_COLUMNS,
@@ -69,7 +69,7 @@ from outlier_embeddings.anomaly_utils import (
 
 # Robustness extensions: slice-trust gating (handles the un-finetuned-encoder
 # circularity) and parcel-aware scoring.
-from outlier_embeddings.robust_extensions import (
+from EBA_detector.robust_extensions import (
     compute_slice_trust,
     apply_trust_to_confidence,
     downgrade_flags_low_trust,

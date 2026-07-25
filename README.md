@@ -1,4 +1,4 @@
-# outlier_embeddings <!-- omit in toc -->
+# EBA_detector <!-- omit in toc -->
 Refactored from the `outliers-from-embeddings` branch of `worldcereal-classification` into a standalone package for better modularity and maintainability.
 
 A private companion package to [WorldCereal classification](https://github.com/WorldCereal/worldcereal-classification) that detects anomalous / potentially mislabelled samples in WorldCereal reference datasets by operating directly on pre-computed **Presto embedding vectors**.
@@ -24,13 +24,13 @@ An **incremental update** mode (`--mode update`) re-scores only the geographic i
 ## Repository layout
 
 ```
-outlier_embeddings/
+EBA_detector/
 ├── pyproject.toml                        # Package definition + dependencies
 ├── README.md
 ├── .gitignore
 │
 ├── src/
-│   └── outlier_embeddings/
+│   └── EBA_detector/
 │       ├── __init__.py
 │       ├── anomaly_utils.py              # Stateless computation helpers (scoring, metrics,
 │       │                                 # normalization, flagging, adaptive H3, incremental utils)
@@ -83,24 +83,24 @@ Or from a local clone:
 pip install -e /path/to/worldcereal-classification
 ```
 
-### Step 2 : Install outlier_embeddings (this package)
+### Step 2 : Install EBA_detector (this package)
 
 ```bash
 # From the private repo:
-pip install "outlier_embeddings @ git+https://github.com/WorldCereal/outlier_embeddings.git"
+pip install "EBA_detector @ git+https://github.com/WorldCereal/EBA_detector.git"
 
 # Or from a local checkout (editable install : recommended for development):
-pip install -e /path/to/outlier_embeddings
+pip install -e /path/to/EBA_detector
 ```
 
 ### Optional extras
 
 ```bash
-pip install "outlier_embeddings[experiments]"  # CatBoost experiments
-pip install "outlier_embeddings[sharepoint]"   # SharePoint legend fetching
-pip install "outlier_embeddings[notebooks]"    # Jupyter environment
-pip install "outlier_embeddings[all]"          # Everything
-pip install "outlier_embeddings[dev]"          # Tests + linting
+pip install "EBA_detector[experiments]"  # CatBoost experiments
+pip install "EBA_detector[sharepoint]"   # SharePoint legend fetching
+pip install "EBA_detector[notebooks]"    # Jupyter environment
+pip install "EBA_detector[all]"          # Everything
+pip install "EBA_detector[dev]"          # Tests + linting
 ```
 
 > **Note:** `prometheo` (the Presto backbone) must also be installed:
@@ -113,7 +113,7 @@ pip install "outlier_embeddings[dev]"          # Tests + linting
 ### Python API
 
 ```python
-from outlier_embeddings.anomaly import run_pipeline
+from EBA_detector.anomaly import run_pipeline
 
 flagged_gdf, summary_df = run_pipeline(
     embeddings_db_path="/data/embeddings_cache.duckdb",
@@ -250,7 +250,7 @@ worldcereal-classification  (main branch : install this first)
 │     • worldcereal.utils.timeseries.process_parquet
 │     • worldcereal.utils.sharepoint.*
 │
-└── outlier_embeddings  (this repo : install on top)
+└── EBA_detector  (this repo : install on top)
       provides:
         • Presto embeddings cache (DuckDB)
         • Embedding-space outlier scoring pipeline

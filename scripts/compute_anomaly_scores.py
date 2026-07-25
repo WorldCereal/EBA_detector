@@ -130,19 +130,19 @@ from typing import Iterator, List, Literal, Optional, Sequence, Tuple, Union
 # ---------------------------------------------------------------------------
 
 def _ensure_packages_importable() -> None:
-    """Ensure both worldcereal and outlier_embeddings are importable.
+    """Ensure both worldcereal and EBA_detector are importable.
 
     When running this script directly (not via an installed package), inserts
     the ``src/`` directories of the respective repos into sys.path so that
     local changes take priority over any installed versions.
 
     Priority order (highest first):
-      1. outlier_embeddings/src/   (this repo)
+      1. EBA_detector/src/   (this repo)
       2. worldcereal-classification/src/  (if a local checkout is present)
     """
     here = Path(__file__).resolve()
 
-    # outlier_embeddings/src/ — parent[2] of scripts/compute_anomaly_scores.py
+    # EBA_detector/src/ — parent[2] of scripts/compute_anomaly_scores.py
     oe_src = here.parents[1] / "src"
     if oe_src.exists() and str(oe_src) not in sys.path:
         sys.path.insert(0, str(oe_src))
@@ -169,8 +169,8 @@ from loguru import logger  # noqa: E402
 from prometheo.models import Presto  # noqa: E402
 from tqdm.auto import tqdm  # noqa: E402
 
-from outlier_embeddings.anomaly import run_pipeline  # noqa: E402
-from outlier_embeddings.anomaly_utils import (  # noqa: E402
+from EBA_detector.anomaly import run_pipeline  # noqa: E402
+from EBA_detector.anomaly_utils import (  # noqa: E402
     ANOMALY_COLUMNS,
     LC10_ANOMALY_COLUMNS,
     CTY24_ANOMALY_COLUMNS,
@@ -179,7 +179,7 @@ from outlier_embeddings.anomaly_utils import (  # noqa: E402
     load_affected_embeddings_from_cache,
     merge_scores_to_long_parquets,
 )
-from outlier_embeddings.embeddings_cache import (  # noqa: E402
+from EBA_detector.embeddings_cache import (  # noqa: E402
     compute_embeddings,
     get_model_hash,
     init_cache,
@@ -298,7 +298,7 @@ def load_presto_model_compat(url_or_path: str) -> torch.nn.Module:
             f"Presto(pretrained_model_path=...) failed ({type(e).__name__}: {e}); "
             "falling back to worldcereal loader"
         )
-        from outlier_embeddings.embeddings_cache import load_presto_model as _load
+        from EBA_detector.embeddings_cache import load_presto_model as _load
         return _load(url_or_path)
 
 

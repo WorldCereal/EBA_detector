@@ -29,7 +29,7 @@ TEST_FRAC=0.2
 
 # ------------------------------------------------------------------ PATHS / ENV
 # Directory that contains run_catboost_proxy.py + data_loader.py (this repo).
-PROXY_DIR=/home/vito/shahs/TestFolder/All_repos/outliers_embeddings/experiments  # <-- set to your checkout
+PROXY_DIR=/home/vito/shahs/TestFolder/All_repos/EBA_detector/experiments  # <-- set to your checkout
 DUCKDB=/home/vito/shahs/TestFolder/wc_outliers/data_for_outlier/EMBEDDINGS_CACHE/embeddings_cache_LANDCOVER10_updated_new_model.duckdb
 MERGED_DIR_normal=/projects/worldcereal/data/cached_wide_merged/Region_wise_files_newmodel
 MERGED_DIR_sharper=/projects/worldcereal/data/cached_wide_merged/Region_wise_files_newmodel_sharper
