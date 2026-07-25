@@ -37,6 +37,22 @@ EMBED_DIM = 128
 EMBED_COLS = [f"embedding_{i}" for i in range(EMBED_DIM)]
 
 
+def detect_embed_dim(con) -> int:
+    """Number of embedding_* columns in the cache table (encoder-agnostic).
+
+    The detector and cache work with any consistent embedding length; this
+    reads the actual width from the table rather than assuming EMBED_DIM, so a
+    64-d AlphaEarth cache or a 128-d Presto cache are both handled. Falls back
+    to EMBED_DIM if the table is absent.
+    """
+    try:
+        names = [r[1] for r in con.execute("PRAGMA table_info('embeddings_cache')").fetchall()]
+        n = sum(1 for c in names if c.startswith("embedding_"))
+        return n or EMBED_DIM
+    except Exception:
+        return EMBED_DIM
+
+
 def load_presto_model(url_or_path: str):
     """Load a Presto checkpoint from a URL or local path.
 
@@ -222,7 +238,8 @@ def fetch_embeddings(
             if c
         ]
     )
-    emb_select = ", ".join([f"e.embedding_{i}" for i in range(EMBED_DIM)])
+    _dim = detect_embed_dim(con)
+    emb_select = ", ".join([f"e.embedding_{i}" for i in range(_dim)])
     query = f"""
         SELECT {cols_select}, {emb_select}
         FROM embeddings_cache e
@@ -237,7 +254,8 @@ def rehydrate_embedding_vectors(wide_df: pd.DataFrame) -> pd.DataFrame:
     """Convert wide embedding columns back into vector form in 'embedding'."""
     if wide_df.empty:
         return wide_df
-    emb_cols_present = [c for c in EMBED_COLS if c in wide_df.columns]
+    emb_cols_present = sorted([c for c in wide_df.columns if c.startswith("embedding_")],
+                              key=lambda c: int(c.split("_")[1]))
     emb_matrix = wide_df[emb_cols_present].to_numpy(dtype=np.float32)
     vectors: List[np.ndarray] = [row for row in emb_matrix]
     out = wide_df.copy()

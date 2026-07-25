@@ -67,6 +67,14 @@ from outlier_embeddings.anomaly_utils import (
     merge_scores_to_long_parquets,
 )
 
+# Robustness extensions: slice-trust gating (handles the un-finetuned-encoder
+# circularity) and parcel-aware scoring.
+from outlier_embeddings.robust_extensions import (
+    compute_slice_trust,
+    apply_trust_to_confidence,
+    downgrade_flags_low_trust,
+)
+
 
 # ===================================================================
 # Pipeline
@@ -419,15 +427,20 @@ def run_pipeline(
     max_slice_size: Optional[int] = None,
     merge_small_slice: bool = True,
     max_merge_iterations=10,
-    threshold_mode: str = "percentile",
+    threshold_mode: str = "mad",
     percentile_q: float = 0.96,
-    mad_k: float = 3.0,
+    mad_k: float = 4.0,
     abs_threshold: Optional[float] = None,
     fdr_alpha: float = 0.05,
     min_flagged_per_slice: Optional[int] = None,
     max_flagged_fraction: Optional[float] = None,
-    max_full_pairwise_n: Optional[int] = 20000,
-    norm_percentiles: Tuple[float, float] = (5.0, 95.0),
+    max_full_pairwise_n: Optional[int] = 0,
+    norm_percentiles: Tuple[float, float] = (2.0, 98.0),
+    centroid_mode: str = "trimmed",
+    centroid_trim: float = 0.05,
+    gate_confidence_by_flag: bool = True,
+    apply_slice_trust: bool = False,
+    slice_trust_min: float = 0.05,
     output_samples_path: Optional[str] = None,
     output_summary_path: Optional[str] = None,
     skip_existing_samples: bool = False,
@@ -490,6 +503,23 @@ def run_pipeline(
         *output_samples_path* / *output_summary_path* are set.  The scored
         DataFrames are still returned.  Default *True* preserves existing
         behaviour.
+    centroid_mode
+        How the per-slice reference centroid is computed: ``"trimmed"``
+        (default; iterative trimmed-mean that resists outlier *masking*),
+        ``"median"`` (per-dimension median), or ``"mean"`` (legacy plain mean —
+        use only for ablations).  The trimmed centroid prevents a contaminated
+        slice from hiding its own outliers by dragging the reference toward the
+        anomalous mass.
+    centroid_trim
+        Fraction of farthest points dropped when recomputing the trimmed
+        centroid.  Should be >= the largest outlier fraction you expect in a
+        slice (default 0.10, matching the typical ``max_flagged_fraction``).
+    gate_confidence_by_flag
+        When *True* (default), ``confidence_nonoutlier`` is clamped to 1.0 for
+        samples that were not flagged, keeping the continuous confidence
+        consistent with the discrete ``anomaly_flag`` and avoiding a spurious
+        penalty on the highest-ranked point of clean slices.  Set *False* for
+        the legacy ungated behaviour.
     """
     group_cols = list(group_cols or [])
     label_cols = _as_label_levels(label_domain)
@@ -733,6 +763,8 @@ def run_pipeline(
             max_full_pairwise_n=max_full_pairwise_n,
             ref_level_col="ref_outlier_level",
             ref_class_col="ref_outlier_class",
+            centroid_mode=centroid_mode,
+            centroid_trim=centroid_trim,
         )
     else:
         # Single-level scoring path
@@ -742,6 +774,8 @@ def run_pipeline(
             label_col=label_col,
             h3_level_name=h3_level_name,
             group_cols=group_cols,
+            centroid_mode=centroid_mode,
+            centroid_trim=centroid_trim,
         )
 
         df_with_centroid = df.merge(
@@ -824,7 +858,16 @@ def run_pipeline(
     print("[anomaly] Computing robust confidence for flagged points...")
 
     flagged_df = add_confidence_from_score(
-        flagged_df, score_col="mean_score", out_col="confidence"
+        flagged_df,
+        score_col="mean_score",
+        out_col="confidence",
+        # Gate by the slice-level flag so that the continuous
+        # confidence_nonoutlier is consistent with the discrete anomaly_flag:
+        # samples the slice threshold did NOT flag keep confidence 1.0 instead
+        # of being penalised purely for being the highest-ranked point of an
+        # otherwise-clean slice.  Set gate_confidence_by_flag=False to restore
+        # the legacy (ungated, rank-driven) behaviour.
+        flagged_col="flagged" if gate_confidence_by_flag else None,
     )
 
     # Boost confidence for undersized slices
@@ -855,6 +898,43 @@ def run_pipeline(
     # 12. Anomaly categorization
     # ------------------------------------------------------------------
     flagged_df = _assign_anomaly_categories(flagged_df)
+
+    # ------------------------------------------------------------------
+    # 12b. Slice-trust gating
+    # ------------------------------------------------------------------
+    # The detector measures distance to a within-slice reference, which is only
+    # meaningful where the (here un-finetuned) embedding geometry actually
+    # separates classes.  Estimate a per-context trust score and use it to (a)
+    # attenuate confidence penalties and (b) downgrade anomaly categories in
+    # slices whose geometry we cannot trust — so untrustworthy slices inject
+    # fewer / softer flags instead of silent noise.
+    if apply_slice_trust:
+        print("[anomaly] Computing slice-trust (embedding separability) gate...")
+        trust_df = compute_slice_trust(
+            df[["sample_id", label_col, *context_cols, "embedding"]],
+            label_col=label_col,
+            context_cols=context_cols,
+            embedding_col="embedding",
+            out_col="slice_trust",
+        )
+        flagged_df = flagged_df.merge(
+            trust_df[["sample_id", "slice_trust"]], on="sample_id", how="left"
+        )
+        flagged_df["slice_trust"] = flagged_df["slice_trust"].fillna(0.5)
+        flagged_df = apply_trust_to_confidence(
+            flagged_df,
+            conf_col="confidence",
+            trust_col="slice_trust",
+            flagged_col="flagged",
+            min_trust=slice_trust_min,
+        )
+        flagged_df = downgrade_flags_low_trust(
+            flagged_df,
+            flag_col="combined_anomaly",
+            trust_col="slice_trust",
+            suspect_min_trust=slice_trust_min,
+            candidate_min_trust=min(2.0 * slice_trust_min, 0.6),
+        )
 
     # ------------------------------------------------------------------
     # 13. Final cleanup & output
@@ -966,11 +1046,11 @@ if __name__ == "__main__":
         merge_small_slice=True,
         threshold_mode="mad",
         percentile_q=0.96,
-        mad_k=3.0,
+        mad_k=4.0,
         abs_threshold=None,
         fdr_alpha=0.05,
         min_flagged_per_slice=None,
-        max_flagged_fraction=0.1,
+        max_flagged_fraction=None,
         max_full_pairwise_n=0,  # disable full pairwise matrix calculation
         norm_percentiles=(2.0, 98.0),
         output_samples_path=str(
@@ -983,3 +1063,4 @@ if __name__ == "__main__":
         ),
         debug=False,
     )
+

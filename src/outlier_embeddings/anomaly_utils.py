@@ -108,6 +108,76 @@ def _cosine_distance_matrix(embeddings: np.ndarray) -> np.ndarray:
     return 1.0 - sim
 
 
+def robust_centroid(
+    embeddings: np.ndarray,
+    mode: str = "trimmed",
+    trim_frac: float = 0.05,
+    n_iter: int = 2,
+) -> np.ndarray:
+    """Compute a centroid that resists contamination by the very outliers we
+    are trying to detect.
+
+    The plain mean is *masked* by outliers: with a 10 % contamination rate the
+    mean is pulled toward the anomalous mass, which deflates the cosine
+    distance of those points and hides them (the classic *masking* problem in
+    outlier detection).  This helper offers contamination-resistant
+    alternatives.
+
+    Parameters
+    ----------
+    embeddings
+        ``(N, D)`` array of slice embeddings.
+    mode
+        - ``"mean"``    : plain mean (legacy behaviour, no robustification).
+        - ``"median"``  : per-dimension median (very robust, cheap).
+        - ``"trimmed"`` : iterative trimmed mean.  Compute the mean, measure
+          cosine distance of every point to it, drop the farthest
+          ``trim_frac`` of points, and recompute the mean on the retained
+          (inlier) set.  Repeated *n_iter* times.  This is the recommended
+          default: it removes the masking effect while staying close to the
+          dense inlier core.
+    trim_frac
+        Fraction of farthest points discarded per iteration in ``"trimmed"``
+        mode.  Should be >= the maximum plausible outlier fraction.
+    n_iter
+        Number of trimming iterations (``"trimmed"`` mode only).
+
+    Returns
+    -------
+    np.ndarray
+        ``(D,)`` centroid vector (float32).
+    """
+    X = np.asarray(embeddings, dtype=np.float32)
+    n = X.shape[0]
+    if n == 0:
+        raise ValueError("Cannot compute a centroid of an empty slice")
+
+    if mode == "mean" or n < 5:
+        return X.mean(axis=0)
+
+    if mode == "median":
+        return np.median(X, axis=0).astype(np.float32, copy=False)
+
+    if mode != "trimmed":
+        raise ValueError("centroid mode must be one of {'mean','median','trimmed'}")
+
+    trim_frac = float(np.clip(trim_frac, 0.0, 0.49))
+    centroid = X.mean(axis=0)
+    keep_n = max(int(np.ceil((1.0 - trim_frac) * n)), 3)
+    for _ in range(max(int(n_iter), 1)):
+        c_norm = centroid / (np.linalg.norm(centroid) + 1e-12)
+        Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
+        dist = 1.0 - (Xn @ c_norm)
+        # indices of the closest keep_n points (the inlier core)
+        keep_idx = np.argpartition(dist, keep_n - 1)[:keep_n]
+        new_centroid = X[keep_idx].mean(axis=0)
+        if np.allclose(new_centroid, centroid, atol=1e-7):
+            centroid = new_centroid
+            break
+        centroid = new_centroid
+    return centroid.astype(np.float32, copy=False)
+
+
 # ---------------------------------------------------------------------------
 # 3. Normalization & rank helpers
 # ---------------------------------------------------------------------------
@@ -481,11 +551,40 @@ def merge_small_slices(
     group_cols = list(group_cols or [])
     key_cols = [*group_cols, label_col, h3_level_name]
 
-    # Pre-compute H3 neighbours for all cells present
-    unique_cells = df[h3_level_name].unique().tolist()
-    neighbour_map = {
-        cell: list(set(_h3.grid_disk(cell, 1)) - {cell}) for cell in unique_cells
-    }
+    # Pre-compute H3 neighbours for all cells present.
+    #
+    # Resolution-aware: in *adaptive* H3 mode the ``effective_h3_cell`` column
+    # mixes cells from several resolutions (dense regions resolved fine, sparse
+    # regions resolved coarse).  ``grid_disk`` only returns same-resolution
+    # neighbours, so a small fine-level (e.g. L3) slice sitting next to a region
+    # that was resolved coarse (e.g. L2) would find *no* neighbour that exists
+    # in the column and could never merge — leaving it permanently undersized.
+    # To fix this we also offer, as merge candidates, the cell's parents at any
+    # coarser resolution that is actually present in the column.  A small L3
+    # slice can then merge into the L2 cell that geographically contains it.
+    present_cells = set(str(c) for c in df[h3_level_name].unique().tolist())
+    try:
+        resolutions_present = sorted({_h3.get_resolution(c) for c in present_cells})
+    except Exception:
+        resolutions_present = []
+
+    neighbour_map = {}
+    for cell in present_cells:
+        cands = set(_h3.grid_disk(cell, 1)) - {cell}  # same-resolution ring
+        try:
+            r = _h3.get_resolution(cell)
+        except Exception:
+            r = None
+        if r is not None:
+            for rr in resolutions_present:
+                if rr < r:  # only coarser parents
+                    try:
+                        cands.add(_h3.cell_to_parent(cell, rr))
+                    except Exception:
+                        pass
+        # Restrict to candidates that actually exist as effective cells so we
+        # never create a brand-new (empty) target slice.
+        neighbour_map[cell] = [c for c in cands if c in present_cells]
 
     # Iterative bulk merge
     counts = df.groupby(key_cols).size()
@@ -559,14 +658,22 @@ def compute_slice_centroids(
     label_col: str = "ewoc_code",
     h3_level_name: str = "h3_l3_cell",
     group_cols: Optional[Sequence[str]] = None,
+    centroid_mode: str = "trimmed",
+    centroid_trim: float = 0.10,
 ) -> pd.DataFrame:
-    """Compute centroids of embeddings per slice (group_cols + h3 + label)."""
+    """Compute centroids of embeddings per slice (group_cols + h3 + label).
+
+    By default a contamination-resistant (iterative trimmed-mean) centroid is
+    used so that slice outliers do not mask themselves by pulling the centroid
+    toward the anomalous mass.  Pass ``centroid_mode="mean"`` for the legacy
+    plain-mean behaviour.
+    """
     group_cols = list(group_cols or [])
     group_keys = [*group_cols, h3_level_name, label_col]
 
     def _centroid(emb_list: Iterable[np.ndarray]) -> np.ndarray:
         arr = np.vstack(list(emb_list))
-        return arr.mean(axis=0)
+        return robust_centroid(arr, mode=centroid_mode, trim_frac=centroid_trim)
 
     centroids = (
         df.groupby(group_keys)["embedding"]
@@ -589,6 +696,8 @@ def compute_scores_for_slice(
     max_full_pairwise_n: Optional[int] = None,
     force_knn: bool = False,
     knn_k: int = 10,
+    centroid_mode: str = "trimmed",
+    centroid_trim: float = 0.10,
 ) -> pd.DataFrame:
     """Compute anomaly scores for a single slice×class dataframe.
 
@@ -604,7 +713,13 @@ def compute_scores_for_slice(
     n = embeddings.shape[0]
 
     if centroid is None:
-        centroid = embeddings.mean(axis=0)
+        # Use a contamination-resistant centroid by default so that the very
+        # outliers we are scoring do not pull the reference point toward
+        # themselves (masking).  Pass centroid_mode="mean" to restore legacy
+        # behaviour.
+        centroid = robust_centroid(
+            embeddings, mode=centroid_mode, trim_frac=centroid_trim
+        )
 
     # Cosine distance to centroid
     cos_dist = np.array(
@@ -691,6 +806,8 @@ def _score_group_simple(
     g: pd.DataFrame,
     norm_percentiles: Tuple[float, float],
     max_full_pairwise_n: Optional[int],
+    centroid_mode: str = "trimmed",
+    centroid_trim: float = 0.10,
 ) -> pd.DataFrame:
     """Score a single group, returning zero scores when the slice is too small."""
     if len(g) < MIN_SCORING_SLICE_SIZE:
@@ -706,6 +823,8 @@ def _score_group_simple(
         max_full_pairwise_n=max_full_pairwise_n,
         force_knn=False,
         knn_k=10,
+        centroid_mode=centroid_mode,
+        centroid_trim=centroid_trim,
     )
 
 
@@ -804,6 +923,8 @@ def score_slices_hierarchical(
     max_full_pairwise_n: Optional[int],
     ref_level_col: str = "ref_outlier_level",
     ref_class_col: str = "ref_outlier_class",
+    centroid_mode: str = "trimmed",
+    centroid_trim: float = 0.10,
 ) -> pd.DataFrame:
     """Score points by level-0 slices, falling back to coarser label levels
     for undersized slices.
@@ -843,7 +964,10 @@ def score_slices_hierarchical(
         scored0 = (
             g0.groupby([*group_cols, h3_level_name, label_cols[0]], group_keys=False)
             .progress_apply(
-                lambda g: _score_group_simple(g, norm_percentiles, max_full_pairwise_n)
+                lambda g: _score_group_simple(
+                    g, norm_percentiles, max_full_pairwise_n,
+                    centroid_mode=centroid_mode, centroid_trim=centroid_trim,
+                )
             )
             .reset_index(drop=True)
         )
@@ -877,7 +1001,10 @@ def score_slices_hierarchical(
             if ref_df.empty:
                 continue
 
-            scored_ref = _score_group_simple(ref_df, norm_percentiles, max_full_pairwise_n)
+            scored_ref = _score_group_simple(
+                ref_df, norm_percentiles, max_full_pairwise_n,
+                centroid_mode=centroid_mode, centroid_trim=centroid_trim,
+            )
             scored_ref = scored_ref[scored_ref["sample_id"].isin(target_ids)]
             if scored_ref.empty:
                 continue
@@ -1107,6 +1234,7 @@ def add_confidence_from_score(
     alpha: float = 0.3,      # tail sharpness (bigger => harsher near 1)
     conf_min: float = 0.01,  # never go below this
     eps: float = 1e-9,       # numerical stability near 1
+    flagged_col: Optional[str] = None,
 ) -> pd.DataFrame:
     """Accelerating confidence drop as score → 1, with hard floor *conf_min*.
 
@@ -1120,6 +1248,22 @@ def add_confidence_from_score(
 
     - ``x <= t``  ⇒  confidence = 1
     - ``x → 1``   ⇒  confidence → conf_min (not 0)
+
+    Flag gating (``flagged_col``)
+    -----------------------------
+    The continuous *score_col* (``mean_score``) is built from **within-slice
+    rank** statistics, so the top-ranked sample of *every* slice receives a
+    high score — even a perfectly clean slice.  Feeding that directly into the
+    confidence curve manufactures low confidence (and thus down-weighting) for
+    the relatively-highest sample of clean slices, and lets the continuous
+    confidence disagree with the discrete ``anomaly_flag``.
+
+    When *flagged_col* is provided, confidence is **clamped to 1.0 for any
+    sample that was not flagged** by :func:`flag_anomalies`.  The decay then
+    only modulates the *severity* of samples that the slice-level threshold
+    already identified as anomalous.  This makes ``confidence_nonoutlier`` and
+    ``anomaly_flag`` mutually consistent and removes the clean-slice penalty —
+    pass ``flagged_col=None`` to restore the legacy ungated behaviour.
     """
     x = pd.to_numeric(df[score_col], errors="coerce").astype("float64")
     x = x.clip(lower=0.0, upper=1.0).to_numpy()
@@ -1138,6 +1282,11 @@ def add_confidence_from_score(
 
     conf_raw = np.exp(-alpha * (y / (1.0 - y + eps)))
     conf = conf_min + (1.0 - conf_min) * conf_raw
+
+    if flagged_col is not None and flagged_col in df.columns:
+        not_flagged = ~df[flagged_col].fillna(False).to_numpy(dtype=bool)
+        conf[not_flagged] = 1.0
+
     conf = np.clip(conf, conf_min, 1.0).astype(np.float32)
 
     df[out_col] = conf
@@ -1317,8 +1466,18 @@ def flag_anomalies(
         elif threshold_mode == "mad":
             med = g[flag_col].median()
             mad = (g[flag_col] - med).abs().median()
-            thr = med + mad_k * (mad if mad > 0 else 1.0)
-            g["flagged"] = g[flag_col] >= thr
+            if mad > 0:
+                thr = med + mad_k * mad
+                g["flagged"] = g[flag_col] >= thr
+            else:
+                # Degenerate slice: MAD == 0 means > 50% of points share the
+                # same score, so there is no robust scale to threshold on.
+                # Previously this fell back to a magic constant (1.0) which,
+                # because S in [0, 1], silently flagged nothing — but would
+                # mis-behave on any other score range.  Be explicit instead:
+                # flag nothing when the robust scale collapses.
+                thr = float("inf")
+                g["flagged"] = False
         elif threshold_mode == "absolute":
             if abs_threshold is None:
                 raise ValueError(
@@ -1821,4 +1980,5 @@ def merge_scores_to_long_parquets(
         gc.collect()
 
     return n_written
+
 

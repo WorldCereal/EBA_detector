@@ -7,7 +7,7 @@ name = "outlier_embeddings"
 version = "0.1.0"
 description = "Embedding-based outlier scoring for WorldCereal reference data"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 
 # ── Core runtime dependencies ─────────────────────────────────────────────────
@@ -57,9 +57,14 @@ notebooks = [
     "folium",
 ]
 
+# Google Earth Engine — for extract_alphaearth_embeddings.py
+gee = [
+    "earthengine-api>=1.7.28",
+]
+
 # Everything
 all = [
-    "outlier_embeddings[experiments,sharepoint,notebooks]",
+    "outlier_embeddings[experiments,sharepoint,notebooks,gee]",
 ]
 
 # Test dependencies
