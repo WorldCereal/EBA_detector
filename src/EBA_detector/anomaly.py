@@ -1023,7 +1023,7 @@ def run_pipeline(
 
 if __name__ == "__main__":
     out_folder = Path(
-        "/home/vito/shahs/TestFolder/Outliers/"
+        "/path/to/TestFolder/Outliers/"
         "h3l2_mad_3_maxrank_groupRefId_sqrtk_norm2_98_new"
     )
     out_folder.mkdir(parents=True, exist_ok=True)

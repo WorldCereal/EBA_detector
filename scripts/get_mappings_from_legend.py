@@ -8,14 +8,14 @@ read the latest legend/mappings Excel directly from the source.
 Environment variables
 ---------------------
 ``WORLDCEREAL_SP_SITE_URL`` (required)
-    The SharePoint site URL, e.g. ``https://vitoresearch.sharepoint.com/sites/21717-ccn-world-cereal``.
+    The SharePoint site URL, e.g. ``https://<your-org>.sharepoint.com/sites/worldcereal``.
 
 ``WORLDCEREAL_SP_FILE_URL`` (required)
     Server-relative URL, drive-relative path, or a full SharePoint share link
     pointing to ``WorldCereal_LC_CT_legend_v2_class_mappings.xlsx``. Examples:
-    ``/sites/21717-ccn-world-cereal/Shared Documents/Research and Development/Legend/WorldCereal_LC_CT_legend_v2_class_mappings.xlsx``
+    ``/sites/worldcereal/Shared Documents/Research and Development/Legend/WorldCereal_LC_CT_legend_v2_class_mappings.xlsx``
     ``Shared Documents/Research and Development/Legend/WorldCereal_LC_CT_legend_v2_class_mappings.xlsx``
-    ``https://vitoresearch.sharepoint.com/:x:/r/sites/21717-ccn-world-cereal/Shared%20Documents/Research%20and%20Development/Legend/WorldCereal_LC_CT_legend_v2_class_mappings.xlsx?...``
+    ``https://<your-org>.sharepoint.com/:x:/r/sites/worldcereal/Shared%20Documents/Research%20and%20Development/Legend/WorldCereal_LC_CT_legend_v2_class_mappings.xlsx?...``
 
 Two authentication flows are supported (client credentials are preferred):
 
@@ -46,9 +46,9 @@ Example
 ...     write_class_mappings_json,
 ... )
 >>> config = SharePointConfig(
-...     site_url="https://vitoresearch.sharepoint.com/sites/21717-ccn-world-cereal",
+...     site_url="https://<your-org>.sharepoint.com/sites/worldcereal",
 ...     file_server_relative_url=(
-...         "/sites/21717-ccn-world-cereal/Shared Documents/Research and Development/Legend/"
+...         "/sites/worldcereal/Shared Documents/Research and Development/Legend/"
 ...         "WorldCereal_LC_CT_legend_v2_class_mappings.xlsx"
 ...     ),
 ...     tenant_id=os.environ.get("WORLDCEREAL_SP_TENANT_ID"),
@@ -212,7 +212,7 @@ def _parse_site_components(site_url: str) -> tuple[str, str]:
     if not parsed.scheme or not parsed.netloc:
         raise ValueError(
             "WORLDCEREAL_SP_SITE_URL must be a complete URL, "
-            "e.g. 'https://vitoresearch.sharepoint.com/sites/worldcereal'."
+            "e.g. 'https://<your-org>.sharepoint.com/sites/worldcereal'."
         )
     site_path = parsed.path.strip("/")
     if not site_path:

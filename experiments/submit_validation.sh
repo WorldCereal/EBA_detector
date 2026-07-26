@@ -28,12 +28,12 @@ SEEDS="0 1 2"
 # ----------------------------------------------------------------------------
 
 # ------------------------------------------------------------------ PATHS / ENV
-PROXY_DIR=/home/vito/shahs/TestFolder/wc_outliers/EBA_detector/experiments   # <-- set to your checkout
+PROXY_DIR=/path/to/TestFolder/wc_outliers/EBA_detector/experiments   # <-- set to your checkout
 DUCKDB=/projects/worldcereal/data/cached_embeddings/embeddings_cache_LANDCOVER10_updated_new.duckdb
 MERGED_DIR_normal=/projects/worldcereal/data/cached_wide_merged/Region_wise_files
 MERGED_DIR_sharper=/projects/worldcereal/data/cached_wide_merged/Region_wise_files_sharper
-OUTROOT=/home/vito/shahs/TestFolder/wc_outliers/data_for_outlier
-LOGDIR=/home/vito/shahs/logs/WCValidation
+OUTROOT=/path/to/TestFolder/wc_outliers/data_for_outlier
+LOGDIR=/path/to/logs/WCValidation
 CONDA_ENV=worldcereal-py311
 PARTITION=cpu
 CPUS=16

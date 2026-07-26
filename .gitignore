@@ -64,3 +64,8 @@ htmlcov/
 
 # Allow test resources
 !tests/testresources/**
+
+# CatBoost run artifacts
+experiments/catboost_info/
+catboost_info/
+*.tmp

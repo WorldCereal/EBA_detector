@@ -51,17 +51,17 @@ python compute_anomaly_scores.py \\
 --embeddings-db-path /data/worldcereal_data/EXTRACTIONS/WORLDCEREAL/EMBEDDINGS_CACHE/embeddings_cache_LANDCOVER10_updated.duckdb \\
 --wide-dir /data/worldcereal_data/EXTRACTIONS/WORLDCEREAL/CACHED_WIDE_MERGED/cached_wide_merged/cached_wide_parquets \\
 --merged-wide-path /data/worldcereal_data/EXTRACTIONS/WORLDCEREAL/CACHED_WIDE_MERGED/cached_wide_merged/worldcereal_all_extractions_wide_month.parquet \\
---sp-env-file /home/wcextractions/.sharepointenv 
+--sp-env-file ~/.sharepointenv 
 
 python compute_anomaly_scores.py \
 --mode rerun \
 --input-format parquet \
---input-long-dir /home/wcextractions/Public/Rosh_temp_work/MOZ_outliers \
---embeddings-db-path /home/wcextractions/Public/Rosh_temp_work/MOZ_outliers/embeddings_cache_LANDCOVER10_updated.duckdb \
---wide-dir /home/wcextractions/Public/Rosh_temp_work/MOZ_outliers/cached_wide_parquets \
---merged-wide-path //home/wcextractions/Public/Rosh_temp_work/MOZ_outliers/MOZ_wide_month.parquet \
+--input-long-dir /path/to/work/MOZ_outliers \
+--embeddings-db-path /path/to/work/MOZ_outliers/embeddings_cache_LANDCOVER10_updated.duckdb \
+--wide-dir /path/to/work/MOZ_outliers/cached_wide_parquets \
+--merged-wide-path //path/to/work/MOZ_outliers/MOZ_wide_month.parquet \
 --compute_h3_levels h3_levels \
---sp-env-file /home/wcextractions/.sharepointenv \
+--sp-env-file ~/.sharepointenv \
 --lc10-h3-levels 2 \
 --lc10-min-slice-size 100 \
 --lc10-mad-k 3.0 \
@@ -75,9 +75,9 @@ python compute_anomaly_scores.py --mode rerun \
     --input-long-dir /data/worldcereal_data/EXTRACTIONS/WORLDCEREAL/MERGED_PARQUETS_PHASEII \
     --embeddings-db-path /data/worldcereal_data/EXTRACTIONS/WORLDCEREAL/EMBEDDINGS_CACHE/embeddings_cache_LANDCOVER10_updated.duckdb \
     --wide-dir /data/worldcereal_data/EXTRACTIONS/WORLDCEREAL/CACHED_WIDE_MERGED\
-    --merged-wide-path //home/wcextractions/Public/Rosh_temp_work/combined_MOZ_outliers/combined_MOZ_wide_month1.parquet \
+    --merged-wide-path //path/to/work/combined_MOZ_outliers/combined_MOZ_wide_month1.parquet \
     --compute_h3_levels h3_levels \
-    --class-mappings-json /vitodata/worldcereal/data/COP4GEOGLAM/mozambique_pm/class_mappings_mozambique_new.json \
+    --class-mappings-json /path/to/worldcereal/data/COP4GEOGLAM/mozambique_pm/class_mappings_mozambique_new.json \
     --lc10-h3-levels 1 \
     --lc10-min-slice-size 50 \
     --lc10-mad-k 3.0 \
@@ -93,12 +93,12 @@ python compute_anomaly_scores.py --mode rerun \
 python compute_anomaly_scores.py \
   --mode rerun \
   --input-format parquet \
-  --input-long-dir /home/wcextractions/Public/Rosh_temp_work/MOZ_outliers \
-  --embeddings-db-path /home/wcextractions/Public/Rosh_temp_work/MOZ_outliers/embeddings_cache_LANDCOVER10_updated.duckdb \
-  --wide-dir /home/wcextractions/Public/Rosh_temp_work/MOZ_outliers/cached_wide_parquets \
-  --merged-wide-path /home/wcextractions/Public/Rosh_temp_work/MOZ_outliers/MOZ_wide_month.parquet \
+  --input-long-dir /path/to/work/MOZ_outliers \
+  --embeddings-db-path /path/to/work/MOZ_outliers/embeddings_cache_LANDCOVER10_updated.duckdb \
+  --wide-dir /path/to/work/MOZ_outliers/cached_wide_parquets \
+  --merged-wide-path /path/to/work/MOZ_outliers/MOZ_wide_month.parquet \
   --compute h3_levels \
-  --class-mappings-json /vitodata/worldcereal/data/COP4GEOGLAM/mozambique_pm/class_mappings_mozambique_new.json \
+  --class-mappings-json /path/to/worldcereal/data/COP4GEOGLAM/mozambique_pm/class_mappings_mozambique_new.json \
   --lc10-class-mapping LANDCOVER10 \
   --lc10-h3-levels 2 --lc10-min-slice-size 100 --lc10-mad-k 3.0 \
   --cty24-class-mapping CROPTYPE_Mozambique \
@@ -1699,7 +1699,7 @@ def _parse_max_timesteps_trim(v: str) -> int | str | None:
 
 def _default_input_dir() -> Path | None:
     for c in [
-        Path("/home/vito/shahs/projects/worldcereal/data/worldcereal_all_extractions.parquet"),
+        Path("/path/to/projects/worldcereal/data/worldcereal_all_extractions.parquet"),
         Path("/projects/worldcereal/data/worldcereal_all_extractions.parquet"),
     ]:
         if c.exists():
