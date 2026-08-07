@@ -388,6 +388,7 @@ def run_noise_experiment(
     score_kwargs: Optional[dict] = None,
     eval_kwargs: Optional[dict] = None,
     score_col: str = "mean_score",
+    baseline: Optional[str] = None,
 ) -> Dict[str, float]:
     """Inject noise → score on the noisy labels → evaluate recovery.
 
@@ -398,13 +399,25 @@ def run_noise_experiment(
     eval_kwargs = dict(eval_kwargs or {})
 
     noisy = inject_label_noise(df, spec)
-    scored = score_embeddings_df(
-        noisy,
-        label_col="label_noisy",
-        h3_col=spec.h3_col,
-        group_cols=score_kwargs.pop("group_cols", ()),
-        **score_kwargs,
-    )
+    if baseline:
+        from .baselines import score_with_baseline
+        scored = score_with_baseline(
+            noisy, baseline,
+            label_col="label_noisy",
+            h3_col=spec.h3_col,
+            group_cols=score_kwargs.get("group_cols", ()),
+            score_kwargs={k: v for k, v in score_kwargs.items()
+                          if k != "group_cols"},
+            seed=spec.seed,
+        )
+    else:
+        scored = score_embeddings_df(
+            noisy,
+            label_col="label_noisy",
+            h3_col=spec.h3_col,
+            group_cols=score_kwargs.pop("group_cols", ()),
+            **score_kwargs,
+        )
     # carry ground truth onto the scored frame via sample_id
     truth_map = noisy.set_index("sample_id")["noise_truth"]
     scored["noise_truth"] = scored["sample_id"].map(truth_map).fillna(False)
@@ -413,6 +426,7 @@ def run_noise_experiment(
         scored, truth_col="noise_truth", score_col=score_col, **eval_kwargs
     )
     row = {
+        "detector": baseline or "eba",
         "mode": spec.mode,
         "rate": spec.rate,
         "seed": spec.seed,
@@ -432,9 +446,13 @@ def sweep(
     group_col: Optional[str] = None,
     score_kwargs: Optional[dict] = None,
     score_col: str = "mean_score",
+    baseline: Optional[str] = None,
 ) -> pd.DataFrame:
     """Sweep noise modes × rates × seeds and return a tidy results DataFrame
-    (one row per run) ready for aggregation / plotting in the paper."""
+    (one row per run) ready for aggregation / plotting in the paper.
+
+    Pass *baseline* in {"global","iforest","lof","spatial"} to score with a
+    reference detector instead of the locality-aware EBA scorer."""
     rows: List[Dict[str, float]] = []
     for mode in modes:
         print(f"Running mode: {mode}")
@@ -450,7 +468,8 @@ def sweep(
                 )
                 rows.append(
                     run_noise_experiment(
-                        df, spec, score_kwargs=score_kwargs, score_col=score_col
+                        df, spec, score_kwargs=score_kwargs, score_col=score_col,
+                        baseline=baseline,
                     )
                 )
     return pd.DataFrame(rows)

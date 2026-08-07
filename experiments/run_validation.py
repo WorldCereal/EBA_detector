@@ -53,6 +53,11 @@ def main() -> None:
     p.add_argument("--score-col", default="mean_score", choices=["S", "mean_score"],
                    help="Detector ranking score. mean_score is what the shipped "
                         "confidence_nonoutlier is built from; S is the raw distance.")
+    p.add_argument("--baseline", default=None,
+                   choices=["global", "iforest", "lof", "spatial"],
+                   help="Score with a reference detector instead of EBA: "
+                        "global (no H3 locality), iforest/lof (off-the-shelf on "
+                        "the same embeddings), or spatial (label-disagreement).")
     p.add_argument("--out-csv", required=True, type=Path)
     args = p.parse_args()
 
@@ -92,6 +97,7 @@ def main() -> None:
         h3_col=h3_col,
         group_col=group_col,
         score_col=args.score_col,
+        baseline=args.baseline,
     )
     args.out_csv.parent.mkdir(parents=True, exist_ok=True)
     res.to_csv(args.out_csv, index=False)
