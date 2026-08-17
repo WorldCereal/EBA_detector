@@ -9,8 +9,11 @@ Rather than reasoning over raw multi-temporal signals, it scores each labelled s
 other samples of the same class in the same locality, flags the ones that stand out, and emits a
 per-sample confidence that downstream training can act on (remove or down-weight).
 
-This repository accompanies the paper *"Embeddings-based Anomaly Detection for Cleaning Global
-Crop-Type Reference Datasets"* (see [Citation](#citation)).
+This repository accompanies the paper **"Embeddings-based Anomaly Detection for Cleaning Global
+Crop-Type Reference Datasets"** ([arXiv:2607.23908](https://arxiv.org/abs/2607.23908), [HTML](https://arxiv.org/html/2607.23908v1), [PDF](https://arxiv.org/pdf/2607.23908))
+
+## News: 
+Accepted for spotlight oral presentation at **[TerraBytes II](https://terrabytes-workshop.github.io/spotlight)** workshop at ECCV 2026, Malmö, Sweden. (see [Citation](#citation)).
 
 ---
 
@@ -40,8 +43,8 @@ The detector treats embeddings as opaque `d`-dimensional vectors and does not de
 architecture that produced them. In this work the primary embeddings come from a Presto-style
 encoder (128-d) as used in WorldCereal, but the same pipeline runs unchanged on other
 representations — we include tooling and notebooks for scoring
-[AlphaEarth](https://arxiv.org/abs/2507.22291) embeddings (64-d), and further encoders
-(e.g. Clay, Prithvi) are a natural extension.
+[AlphaEarth](https://arxiv.org/abs/2507.22291) embeddings (64-d) and **soon** to be included **TESSERA v1.1** embeddings,
+and further encoders (e.g. Clay, Prithvi) are a natural extension.
 
 ---
 
@@ -58,7 +61,7 @@ EBA_detector/
 │   │                           # flagging, adaptive H3, incremental utilities
 │   ├── anomaly.py              # Pipeline orchestration: load -> map -> score -> flag -> write
 │   ├── robust_extensions.py    # Trimmed centroid, slice-trust gate, group aggregation
-│   ├── embeddings_cache.py     # DuckDB-backed embedding cache (build + query)
+│   ├── embeddings_cache.py     # DuckDB-backed embedding cache (Presto, 128-d)
 │   ├── validation.py           # Synthetic label-noise injection & recovery metrics
 │   └── experiments.py          # CatBoost-on-embeddings downstream experiments
 │
@@ -93,7 +96,7 @@ The package works **alongside** the main `worldcereal-classification` package (i
 | Import | Where used | Purpose |
 |---|---|---|
 | `worldcereal.utils.refdata.get_class_mappings` / `map_classes` | `anomaly.py` | Map `ewoc_code` -> label class |
-| `worldcereal.train.datasets.WorldCerealTrainingDataset` | `embeddings_cache.py` | DataLoader for embedding inference |
+| `worldcereal.train.datasets.WorldCerealTrainingDataset` | `embeddings_cache.py`| DataLoader for embedding inference |
 | `worldcereal.utils.timeseries.process_parquet` | `compute_anomaly_scores.py` | Pivot long -> wide parquets |
 
 Everything else (scoring, flagging, caching, incremental updates, validation) lives entirely
@@ -219,11 +222,12 @@ If you use this code, please cite:
   author  = {Ali Shah, Syed Roshaan and Van Tricht, Kristof and Butsko, Christina and
              Degerickx, Jeroen and Szantoi, Zoltan},
   year    = {2026},
-  note    = {arXiv preprint}
+  journal = {arXiv preprint arXiv:2607.23908},
+  url     = {https://arxiv.org/abs/2607.23908}
 }
 ```
 
-*(arXiv identifier to be added once the preprint is posted.)*
+Accepted for spotlight oral presentation at **[TerraBytes II](https://terrabytes-workshop.github.io/spotlight)** workshop at ECCV 2026, Malmö, Sweden.
 
 ---
 
