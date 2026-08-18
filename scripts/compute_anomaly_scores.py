@@ -243,7 +243,7 @@ class AnomalyRunConfig:
     merge_small_slice: bool = True
     max_merge_iterations: int = 16
     threshold_mode: str = "stable_mad"
-    mad_k: float = 3.0
+    mad_k: float = 3.3
     percentile_q: float = 0.96
     max_full_pairwise_n: int = 0
     norm_percentiles: Tuple[float, float] = (2.0, 98.0)
@@ -263,10 +263,11 @@ class AnomalyRunConfig:
     time_col: Optional[str] = None
     # --- absolute-scale gate ---------------------------------------------
     require_absolute: bool = True
-    abs_z_k: float = 3.0
+    abs_z_k: float = 3.3
     abs_z_suspect: float = 4.0
     abs_z_candidate: float = 5.5
     abs_combine: str = "min"
+    null_scale_estimator: str = "left_tail"
     # Extra columns conditioning the cross-slice null (e.g. a continent or
     # year column) when distance scales differ systematically between them.
     # Without this the null pools per class only, so classes spanning
@@ -806,6 +807,7 @@ def run_single_domain_scoring(
             abs_z_suspect=config.abs_z_suspect,
             abs_z_candidate=config.abs_z_candidate,
             abs_combine=config.abs_combine,
+            null_scale_estimator=config.null_scale_estimator,
             null_extra_keys=config.null_extra_keys,
             min_scoring_slice_size=config.min_scoring_slice_size,
             quality_gate=config.quality_gate,
@@ -1872,7 +1874,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     lc10.add_argument("--lc10-min-slice-size",       type=int, default=200)
     lc10.add_argument("--lc10-max-slice-size",       type=int, default=10_000)
     lc10.add_argument("--lc10-max-merge-iterations", type=int, default=16)
-    lc10.add_argument("--lc10-mad-k",                type=float, default=3.0)
+    lc10.add_argument("--lc10-mad-k",                type=float, default=3.3)
 
     # CTY24 scoring
     cty = p.add_argument_group("CROPTYPE24 scoring")
@@ -1888,7 +1890,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     cty.add_argument("--cty24-min-slice-size",        type=int, default=100)
     cty.add_argument("--cty24-max-slice-size",        type=int, default=5_000)
     cty.add_argument("--cty24-max-merge-iterations",  type=int, default=8)
-    cty.add_argument("--cty24-mad-k",                 type=float, default=3.0)
+    cty.add_argument("--cty24-mad-k",                 type=float, default=3.3)
 
     # Common scoring
     common = p.add_argument_group("common scoring")
@@ -1937,10 +1939,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "thresholds whether or not the slice contains a single error."
         ),
     )
-    absg.add_argument("--abs-z-k",         type=float, default=3.0,
+    absg.add_argument("--abs-z-k",         type=float, default=3.3,
                       help="Robust sigma required to flag (default 3.0).")
     absg.add_argument("--abs-z-suspect",   type=float, default=4.0)
     absg.add_argument("--abs-z-candidate", type=float, default=5.5)
+    absg.add_argument("--null-scale-estimator", type=str, default="left_tail",
+                      choices=["left_tail", "mad"],
+                      help=("Per-slice dispersion feeding the cross-slice null. "
+                            "left_tail (median-q25) uses only the clean left half, "
+                            "so contamination present in every slice cannot inflate "
+                            "the null. 'mad' is the legacy estimator (ablation only)."))
     absg.add_argument("--abs-combine",     type=str, default="min",
                       choices=["min", "max", "mean"],
                       help=("How to combine the centroid-distance and kNN-distance "
@@ -2074,6 +2082,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         abs_z_suspect=args.abs_z_suspect,
         abs_z_candidate=args.abs_z_candidate,
         abs_combine=args.abs_combine,
+        null_scale_estimator=args.null_scale_estimator,
         null_extra_keys=list(args.null_extra_keys) if args.null_extra_keys else None,
         purity_veto=args.purity_veto,
         min_scoring_slice_size=args.min_scoring_slice_size,

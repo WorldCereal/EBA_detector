@@ -566,3 +566,88 @@ class TestValidationHarnessRobustness:
         assert len(out) == len(df)
         assert not out["flagged"].any()
         assert not out["scored"].any()
+
+
+# ---------------------------------------------------------------------------
+# 8. The operational target: heavy but sub-majority slice contamination
+# ---------------------------------------------------------------------------
+
+
+class TestHeavyContaminationRegime:
+    """Up to ~40% of a slice wrong must still be detectable.
+
+    The blocker was not the centroid but the *scale*: the cross-slice null took
+    the median of per-slice MADs, and a MAD is inflated by the very
+    right-side contamination it is meant to measure against.  When every slice
+    of a class is 30-45% contaminated the null inflates with them, z-scores
+    shrink, and detection collapses.  ``_slice_stats(estimator="left_tail")``
+    measures the spread from the clean left half instead.
+    """
+
+    @pytest.mark.parametrize(
+        "contamination,min_recall", [(0.20, 0.90), (0.30, 0.85), (0.40, 0.45)]
+    )
+    def test_recall_holds_up_to_forty_percent(self, contamination, min_recall):
+        flagged = flag_world(score_world(make_world(contamination), centroid_trim=0.45))
+        t = flagged["truth"].to_numpy()
+        h = flagged["flagged"].to_numpy()
+        recall = (h & t).sum() / max(t.sum(), 1)
+        precision = (h & t).sum() / max(h.sum(), 1)
+        assert recall >= min_recall, f"recall {recall:.3f} at {contamination:.0%}"
+        assert precision > 0.9
+
+    def test_left_tail_beats_mad_where_it_matters(self):
+        """At 40% the legacy MAD null is what fails, not the geometry."""
+        df = make_world(0.40)
+        parts = []
+        for _k, g in df.groupby(["h3_l3_cell", "label"], sort=True):
+            sc = compute_scores_for_slice(
+                g, max_full_pairwise_n=0, force_knn=True, centroid_trim=0.45
+            )
+            sc["scored"] = True
+            parts.append(sc)
+        scored = pd.concat(parts, ignore_index=True)
+
+        rec = {}
+        for est in ("mad", "left_tail"):
+            nr = compute_null_reference(
+                scored,
+                null_keys=["label"],
+                slice_key_cols=["h3_l3_cell", "label"],
+                scored_mask_col="scored",
+                scale_estimator=est,
+            )
+            s2 = add_absolute_scores(scored.copy(), nr, null_keys=["label"])
+            fl = flag_world(s2)
+            t = fl["truth"].to_numpy()
+            h = fl["flagged"].to_numpy()
+            rec[est] = (h & t).sum() / max(t.sum(), 1)
+        # Measured ~0.89 vs ~0.45; guard with headroom rather than the exact ratio.
+        assert rec["left_tail"] > 1.6 * max(rec["mad"], 1e-6), rec
+        assert rec["left_tail"] > 0.7, rec
+
+    def test_contamination_does_not_inflate_the_left_tail_null(self):
+        """The whole point: the null scale must barely move with contamination."""
+        scales = {}
+        for contamination in (0.0, 0.40):
+            scored = score_world(make_world(contamination), centroid_trim=0.45)
+            nr = compute_null_reference(
+                scored,
+                null_keys=["label"],
+                slice_key_cols=["h3_l3_cell", "label"],
+                scored_mask_col="scored",
+            )
+            own = nr[nr["__is_global__"] != True]  # noqa: E712
+            scales[contamination] = float(own["cosine_distance_null_scale"].iloc[0])
+        # The left-tail estimator does not fully escape inflation: at 40%
+        # contamination the slice MEDIAN itself sits high inside the clean
+        # group, so the median-to-q25 span covers a wider slice of the clean
+        # distribution than it would on clean data.  Measured ~2x, against
+        # ~3.5x for the MAD it replaces - enough to keep the gate usable.
+        inflation = scales[0.40] / scales[0.0]
+        assert inflation < 2.5, f"null scale inflated {inflation:.2f}x by contamination"
+
+    def test_clean_population_still_quiet(self):
+        """The recall gain must not have been bought with false positives."""
+        flagged = flag_world(score_world(make_world(0.0), centroid_trim=0.45))
+        assert flagged["flagged"].mean() < 0.02

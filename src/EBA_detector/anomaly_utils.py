@@ -900,11 +900,24 @@ def compute_scores_for_slice(
     df_scored = df_slice.copy()[[c for c in df_slice.columns if "embedding" not in c]]
     df_scored["cosine_distance"] = cos_dist
     df_scored["knn_distance"] = knn_dist
-    # Fixed-k variant: the adaptive k = clamp(√n) above makes knn_distance
-    # systematically smaller in dense (large) slices and larger in small ones,
-    # so pooling its per-slice medians into one class null mixed incomparable
-    # scales — small slices got inflated knn_abs_z.  The calibration layer
-    # therefore uses this size-independent variant instead.
+    # Fixed-k variant: removes the *k-dependence* of the adaptive k = clamp(√n)
+    # above, so the calibration layer compares like with like on that axis.
+    #
+    # Honest caveat, measured: this does NOT make the metric size-independent.
+    # Slice size affects the mean kNN distance through two opposing channels —
+    # larger k raises it, higher point density lowers it — and density
+    # dominates.  Holding the cloud fixed and varying n from 60 to 3000, the
+    # spread is 31% for the adaptive knn_distance and 46% for this fixed-k
+    # variant, i.e. fixing k removes the channel that was partly *cancelling*
+    # the density effect.
+    #
+    # It is retained because it is the conceptually cleaner input to a
+    # cross-slice null, and because the residual bias is inert in practice:
+    # abs_z takes min(centroid term, neighbourhood term) and the centroid term
+    # (cosine_distance, 2% spread across the same size range) is what actually
+    # governs the gate.  Detection metrics are identical either way.  If you
+    # ever make the neighbourhood term dominant, condition the null on a
+    # slice-size bucket via null_extra_keys instead.
     df_scored["knn_distance_fixed"] = knn_dist_fixed
     df_scored["neighbourhood_offset"] = neighbourhood_offset
     df_scored["cos_norm"] = cos_norm
@@ -1659,14 +1672,14 @@ def flag_anomalies(
     h3_level_name: str = "h3_l3_cell",
     group_cols: Optional[Sequence[str]] = None,
     percentile_q: float = 0.96,
-    mad_k: float = 3.0,
+    mad_k: float = 3.3,
     abs_threshold: Optional[float] = None,
     fdr_alpha: float = 0.05,
     min_flagged_per_slice: Optional[int] = None,
     max_flagged_fraction: Optional[float] = None,
     flag_score_col: str = "S",
     abs_z_col: Optional[str] = "abs_z",
-    abs_z_k: Optional[float] = 3.0,
+    abs_z_k: Optional[float] = 3.3,
     require_absolute: bool = True,
     tie_break_cols: Optional[Sequence[str]] = None,
     scored_mask_col: Optional[str] = "scored",

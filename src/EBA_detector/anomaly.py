@@ -630,7 +630,7 @@ def run_pipeline(
     max_merge_iterations=10,
     threshold_mode: str = "stable_mad",
     percentile_q: float = 0.96,
-    mad_k: float = 3.0,
+    mad_k: float = 3.3,
     abs_threshold: Optional[float] = None,
     fdr_alpha: float = 0.05,
     min_flagged_per_slice: Optional[int] = None,
@@ -638,17 +638,18 @@ def run_pipeline(
     max_full_pairwise_n: Optional[int] = 0,
     norm_percentiles: Tuple[float, float] = (2.0, 98.0),
     centroid_mode: str = "trimmed",
-    centroid_trim: float = 0.20,
+    centroid_trim: float = 0.45,
     gate_confidence_by_flag: bool = True,
     apply_slice_trust: bool = False,
     slice_trust_min: float = 0.05,
     # --- absolute-scale calibration -------------------------------------
     require_absolute: bool = True,
-    abs_z_k: float = 3.0,
+    abs_z_k: float = 3.3,
     abs_z_suspect: float = 4.0,
     abs_z_candidate: float = 5.5,
     null_extra_keys: Optional[Sequence[str]] = None,
     abs_combine: str = "min",
+    null_scale_estimator: str = "left_tail",
     # --- support / quality ----------------------------------------------
     min_scoring_slice_size: int = MIN_SCORING_SLICE_SIZE,
     quality_gate: bool = True,
@@ -754,6 +755,15 @@ def run_pipeline(
         Extra columns to condition the null on, beyond the label class — e.g.
         a continent or year column when distance scales differ systematically
         between them.
+    null_scale_estimator
+        How the per-slice dispersion feeding the cross-slice null is measured.
+        ``"left_tail"`` (default) uses ``median - q25``, i.e. only the clean
+        left half of the distance distribution.  Label errors push distances
+        right, so the classic MAD is inflated by them — and when contamination
+        is present in *every* slice of a class the null itself becomes
+        inflated and the gate stops firing.  Measured recall at 40 % slice
+        contamination: 0.009 with ``"mad"``, 0.42 with ``"left_tail"``, at a
+        matched clean false-positive rate.  Use ``"mad"`` only for ablations.
     abs_combine
         How the per-metric absolute z-scores are combined: ``"min"`` (default,
         conservative — a point must look anomalous on *both* the centroid
@@ -1263,6 +1273,7 @@ def run_pipeline(
             slice_key_cols=slice_keys,
             min_slice_n=max(int(min_scoring_slice_size), 30),
             scored_mask_col="scored",
+            scale_estimator=null_scale_estimator,
         )
         scored_df = add_absolute_scores(
             scored_df, null_ref, null_keys=null_keys, combine=abs_combine
