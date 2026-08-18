@@ -647,7 +647,7 @@ def run_pipeline(
     abs_z_k: float = 3.3,
     abs_z_suspect: float = 4.0,
     abs_z_candidate: float = 5.5,
-    null_extra_keys: Optional[Sequence[str]] = None,
+    null_extra_keys: Optional[Sequence[str]] = ("h3_effective_level",),
     abs_combine: str = "min",
     null_scale_estimator: str = "left_tail",
     # --- support / quality ----------------------------------------------

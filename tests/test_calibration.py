@@ -651,3 +651,106 @@ class TestHeavyContaminationRegime:
         """The recall gain must not have been bought with false positives."""
         flagged = flag_world(score_world(make_world(0.0), centroid_trim=0.45))
         assert flagged["flagged"].mean() < 0.02
+
+
+# ---------------------------------------------------------------------------
+# 9. Conditioning the null on the resolution each slice resolved at
+# ---------------------------------------------------------------------------
+
+
+def _mixed_resolution_world(contamination: float = 0.0, seed: int = 0):
+    """Dense fine-level slices + sparse coarse-level ones.
+
+    Mimics the real geography: most points sit in one continent and resolve at a
+    fine H3 level (small, homogeneous cells), while sparse regions resolve at a
+    coarse level whose cells span several agro-ecological zones and therefore
+    carry genuinely wider *legitimate* within-class dispersion.
+    """
+    r = np.random.default_rng(seed)
+    rows = []
+    for s in range(40):  # fine / dense / tight
+        c = r.normal(size=D) * 0.12 + np.eye(D)[0]
+        X = r.normal(size=(400, D)) * 0.22 + c
+        n_out = int(contamination * 400)
+        if n_out:
+            X[:n_out] = r.normal(size=(n_out, D)) * 0.22 + (
+                r.normal(size=D) * 0.12 + np.eye(D)[1]
+            )
+        for i in range(400):
+            rows.append((f"f{s}_{i}", f"fine{s}", "maize", X[i].astype(np.float32), 4,
+                         i < n_out))
+    for s in range(12):  # coarse / sparse / genuinely wider
+        c = r.normal(size=D) * 0.12 + np.eye(D)[0]
+        X = r.normal(size=(150, D)) * 0.38 + c
+        n_out = int(contamination * 150)
+        if n_out:
+            X[:n_out] = r.normal(size=(n_out, D)) * 0.22 + (
+                r.normal(size=D) * 0.12 + np.eye(D)[1]
+            )
+        for i in range(150):
+            rows.append((f"c{s}_{i}", f"coarse{s}", "maize", X[i].astype(np.float32), 2,
+                         i < n_out))
+    return pd.DataFrame(
+        rows,
+        columns=["sample_id", "h3_l3_cell", "label", "embedding",
+                 "h3_effective_level", "truth"],
+    )
+
+
+def _score_with_null_keys(df, extra_keys):
+    parts = []
+    for _k, g in df.groupby(["h3_l3_cell", "label"], sort=True):
+        sc = compute_scores_for_slice(
+            g, max_full_pairwise_n=0, force_knn=True, centroid_trim=0.45
+        )
+        sc["scored"] = True
+        parts.append(sc)
+    scored = pd.concat(parts, ignore_index=True)
+    keys = ["label"] + list(extra_keys)
+    null_ref = compute_null_reference(
+        scored, null_keys=keys, slice_key_cols=["h3_l3_cell", "label"],
+        scored_mask_col="scored",
+    )
+    scored = add_absolute_scores(scored, null_ref, null_keys=keys)
+    return flag_world(scored, mad_k=3.3, abs_z_k=3.3)
+
+
+class TestNullConditionedOnResolution:
+    def test_pooling_biases_false_positives_toward_coarse_slices(self):
+        """The bias this conditioning exists to remove.
+
+        Coarse (sparse-region) slices legitimately disperse more, so against a
+        null dominated by fine dense slices they look anomalous as a group.
+        """
+        flagged = _score_with_null_keys(_mixed_resolution_world(), [])
+        fine = flagged["h3_effective_level"] == 4
+        coarse = flagged["h3_effective_level"] == 2
+        assert flagged.loc[coarse, "flagged"].mean() > (
+            4 * flagged.loc[fine, "flagged"].mean()
+        )
+
+    def test_conditioning_equalises_the_false_positive_rate(self):
+        flagged = _score_with_null_keys(
+            _mixed_resolution_world(), ["h3_effective_level"]
+        )
+        fine = flagged.loc[flagged["h3_effective_level"] == 4, "flagged"].mean()
+        coarse = flagged.loc[flagged["h3_effective_level"] == 2, "flagged"].mean()
+        assert coarse < 0.02
+        assert coarse < 3 * max(fine, 1e-6)
+
+    def test_detection_in_dense_slices_is_unharmed(self):
+        """The conditioning must not cost anything where most points are."""
+        flagged = _score_with_null_keys(
+            _mixed_resolution_world(0.20, seed=1), ["h3_effective_level"]
+        )
+        m = flagged["h3_effective_level"] == 4
+        t = flagged.loc[m, "truth"].to_numpy()
+        h = flagged.loc[m, "flagged"].to_numpy()
+        assert (h & t).sum() / max(t.sum(), 1) > 0.9
+        assert (h & t).sum() / max(h.sum(), 1) > 0.95
+
+    def test_missing_conditioner_is_ignored_not_fatal(self):
+        """Fixed (non-adaptive) H3 mode has no h3_effective_level column."""
+        df = _mixed_resolution_world().drop(columns=["h3_effective_level"])
+        flagged = _score_with_null_keys(df, ["h3_effective_level"])
+        assert len(flagged) == len(df)

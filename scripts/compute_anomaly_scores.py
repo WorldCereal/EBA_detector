@@ -249,13 +249,26 @@ class AnomalyRunConfig:
     norm_percentiles: Tuple[float, float] = (2.0, 98.0)
     skip_classes: Optional[List[str]] = field(default_factory=lambda: ["ignore"])
     # --- slice definition -------------------------------------------------
-    # group_cols was previously hard-coded to None here while the README and
-    # anomaly.py's __main__ both used ["ref_id"].  That silently changed the
-    # semantics of every production run: slices pooled across all source
-    # datasets, so a dataset digitised against a different legend either masked
-    # itself (if large) or was flagged wholesale (if small).  It is now an
-    # explicit, documented choice.
-    group_cols: Optional[List[str]] = field(default_factory=lambda: ["ref_id"])
+    # Pooled across source datasets by default (i.e. slice = H3 cell + class).
+    #
+    # This is deliberate and is the assumption the whole method rests on: wheat
+    # in one dataset should look like wheat in another dataset in the same
+    # locality, so a sample that does not is evidence of a label error.
+    # Splitting by ref_id throws that comparison away.  It also interacts badly
+    # with the very uneven dataset sizes here (1.2k vs 25k points in one
+    # region): the small datasets fragment below min_slice_size and come back
+    # `unscored`, so only the large ones actually get scrutinised.
+    #
+    # Measured: a wholly-mislabelled dataset was INVISIBLE under
+    # group_cols=["ref_id"] (abs_z = -0.15, 0/360 flagged) because it formed its
+    # own internally-consistent slice, and was caught cleanly when pooled
+    # (abs_z = 5.45, 339/360 escalated).
+    #
+    # Set ["ref_id"] only if you specifically want each dataset scored against
+    # itself; the contamination-resistant centroid (centroid_trim) and the
+    # left-tail null scale are what stop a large dataset dragging the pooled
+    # reference.
+    group_cols: Optional[List[str]] = field(default_factory=list)
     # Context for the auxiliary (purity / margin) signals. Geographic by
     # default: it must NOT inherit group_cols, or single-crop datasets lose
     # those votes entirely. See run_pipeline section 7.
@@ -268,11 +281,30 @@ class AnomalyRunConfig:
     abs_z_candidate: float = 5.5
     abs_combine: str = "min"
     null_scale_estimator: str = "left_tail"
-    # Extra columns conditioning the cross-slice null (e.g. a continent or
-    # year column) when distance scales differ systematically between them.
-    # Without this the null pools per class only, so classes spanning
-    # heterogeneous regions get a regional false-positive bias.
-    null_extra_keys: Optional[List[str]] = None
+    # Extra columns conditioning the cross-slice null.
+    #
+    # Defaults to the adaptive H3 resolution each slice resolved at.  In
+    # adaptive mode a sparse-region slice can be an L2 cell (~332 km across)
+    # while a dense-region slice is L4 (~47 km); the coarser one spans several
+    # agro-ecological zones and therefore has genuinely wider *legitimate*
+    # within-class dispersion.  Pooling them into one null means the sparse
+    # slices are judged against a scale set by the dense ones - and with ~82% of
+    # WorldCereal points in Europe, that scale is essentially European.
+    #
+    # Measured on clean synthetic data with both populations present: pooling
+    # gave the coarse-level slices a 10.4x higher false-positive rate than the
+    # fine-level ones (5.44% vs 0.53%); conditioning on the level equalised them
+    # (0.50% vs 0.66%).  That bias lands hardest in exactly the regions that are
+    # hardest to verify on a basemap.
+    #
+    # Trade-off: it also removes the recall that the bias was manufacturing in
+    # those regions (at 20% contamination, coarse-slice recall 0.64 -> 0.36) and
+    # raises their precision (0.95 -> 0.99).  Add a continent or year column
+    # here too if you know distance scales differ across them.  The column is
+    # silently ignored in fixed (non-adaptive) H3 mode, where it does not exist.
+    null_extra_keys: Optional[List[str]] = field(
+        default_factory=lambda: ["h3_effective_level"]
+    )
     # --- support / quality ------------------------------------------------
     min_scoring_slice_size: int = 50
     quality_gate: bool = True
@@ -1908,7 +1940,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     common.add_argument("--skip-classes",        type=str, nargs="+", default=["ignore"])
     common.add_argument("--max-full-pairwise-n", type=int, default=0)
     common.add_argument(
-        "--group-cols", type=str, nargs="*", default=["ref_id"],
+        "--group-cols", type=str, nargs="*", default=[],
         help=(
             "Extra columns that join the slice key, on top of the H3 cell and "
             "the label. Default ['ref_id'] scores each source dataset against "
@@ -1954,7 +1986,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                       help=("How to combine the centroid-distance and kNN-distance "
                             "z-scores. 'min' (default) demands both."))
     absg.add_argument(
-        "--null-extra-keys", type=str, nargs="*", default=None,
+        "--null-extra-keys", type=str, nargs="*", default=["h3_effective_level"],
         help=("Extra columns conditioning the cross-slice null beyond the "
               "label class (e.g. a continent or year column). Use when "
               "legitimate distance scales differ systematically between "
@@ -2083,7 +2115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         abs_z_candidate=args.abs_z_candidate,
         abs_combine=args.abs_combine,
         null_scale_estimator=args.null_scale_estimator,
-        null_extra_keys=list(args.null_extra_keys) if args.null_extra_keys else None,
+        null_extra_keys=list(args.null_extra_keys) if args.null_extra_keys else [],
         purity_veto=args.purity_veto,
         min_scoring_slice_size=args.min_scoring_slice_size,
         quality_gate=not bool(args.no_quality_gate),

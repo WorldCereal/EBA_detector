@@ -198,8 +198,19 @@ def compute_null_reference(
         plus the *null_keys*.  A sentinel row with ``__is_global__ = True``
         carries the fallback.
     """
-    null_keys = list(null_keys)
-    slice_key_cols = list(slice_key_cols)
+    # Drop conditioners that are not columns here.  The default null key
+    # ``h3_effective_level`` only exists in adaptive H3 mode, so a fixed-level
+    # run (or a caller passing a column this frame does not carry) must degrade
+    # to a coarser null rather than raising deep inside a groupby.
+    requested_null_keys = list(null_keys)
+    null_keys = [k for k in requested_null_keys if k in df_scores.columns]
+    dropped = [k for k in requested_null_keys if k not in df_scores.columns]
+    if dropped:
+        print(
+            f"[calibration] NOTE: null conditioner(s) {dropped} not present; "
+            "the null is pooled without them."
+        )
+    slice_key_cols = [c for c in slice_key_cols if c in df_scores.columns]
     metric_cols = [c for c in metric_cols if c in df_scores.columns]
     # Prefer the fixed-k variant, which removes the k-dependence of the
     # adaptive knn_distance.  It does NOT remove the density component of the
@@ -368,7 +379,11 @@ def add_absolute_scores(
     if combine not in {"min", "max", "mean"}:
         raise ValueError("combine must be one of {'min','max','mean'}")
 
-    null_keys = list(null_keys)
+    # Mirror compute_null_reference: a conditioner absent from either side is
+    # dropped, so the null_ref built above and the merge below agree on keys.
+    null_keys = [
+        k for k in null_keys if k in df_scores.columns and k in null_ref.columns
+    ]
     # Only calibrate metrics that exist both on the data and in the null
     # reference — callers may legitimately pass a null built for fewer metrics
     # (e.g. an older cached reference without neighbourhood_offset).
