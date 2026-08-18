@@ -65,6 +65,7 @@ CTY24_ANOMALY_COLUMNS: List[str] = [
 _SCORE_COLS: List[str] = [
     "cosine_distance",
     "knn_distance",
+    "knn_distance_fixed",
     "neighbourhood_offset",
     "cos_norm",
     "knn_norm",
@@ -592,7 +593,10 @@ def merge_small_slices(
     Merge policy
     ------------
     * A merge is only accepted when the target actually contributes points
-      (``best_count > 0``) **and** the merged slice is closer to *min_size*.
+      (``best_count > 0``); the iteration loop as a whole stops when the
+      number of undersized slices stops improving by *min_improvement*.
+      Note that ``max_slice_size`` is NOT consulted here: a small slice can be
+      absorbed into a neighbour that is already large.
     * Targets are restricted to cells present in the data and to the same or a
       coarser resolution, so a merge never invents an empty cell.
     * Candidate ordering is deterministic (count desc, then cell id) so the
@@ -806,8 +810,12 @@ def compute_scores_for_slice(
     use_knn_only = force_knn or (max_full_pairwise_n is not None and n > max_full_pairwise_n)
 
     neigh_idx: Optional[np.ndarray] = None
+    # Fixed-k companion metric (see below): mean distance to the knn_k nearest
+    # neighbours regardless of slice size.
+    k_fixed = min(int(knn_k), n - 1) if n > 1 else 0
     if k <= 0:
         knn_dist = np.zeros(n, dtype=np.float32)
+        knn_dist_fixed = np.zeros(n, dtype=np.float32)
     elif use_knn_only:
         # kNN-only path (memory friendly for large slices)
         nn = NearestNeighbors(
@@ -819,20 +827,30 @@ def compute_scores_for_slice(
         nn.fit(embeddings)
         distances, neigh = nn.kneighbors(embeddings)
         knn_dist = distances[:, 1:].mean(axis=1).astype(np.float32, copy=False)
+        # kneighbors returns distances sorted ascending, so the first k_fixed
+        # non-self columns are exactly the k_fixed nearest neighbours.
+        knn_dist_fixed = (
+            distances[:, 1 : k_fixed + 1].mean(axis=1).astype(np.float32, copy=False)
+        )
         neigh_idx = neigh[:, 1:]
     else:
         # Full pairwise NxN (more memory intensive)
         dist_matrix = _cosine_distance_matrix(embeddings)
         np.fill_diagonal(dist_matrix, np.inf)
         part = np.argpartition(dist_matrix, k, axis=1)[:, :k]
-        knn_dist = (
-            np.take_along_axis(dist_matrix, part, axis=1)
+        knn_vals = np.take_along_axis(dist_matrix, part, axis=1)
+        knn_dist = knn_vals.mean(axis=1).astype(np.float32, copy=False)
+        # argpartition does not sort within the partition: sort the k values
+        # per row so the first k_fixed really are the nearest ones.
+        knn_dist_fixed = (
+            np.sort(knn_vals, axis=1)[:, :k_fixed]
             .mean(axis=1)
             .astype(np.float32, copy=False)
         )
         neigh_idx = part
 
     knn_dist = np.nan_to_num(knn_dist, nan=0.0, posinf=0.0, neginf=0.0)
+    knn_dist_fixed = np.nan_to_num(knn_dist_fixed, nan=0.0, posinf=0.0, neginf=0.0)
 
     # --- neighbourhood offset ------------------------------------------
     # A *small* kNN distance is normally evidence that a point is an inlier.
@@ -882,6 +900,12 @@ def compute_scores_for_slice(
     df_scored = df_slice.copy()[[c for c in df_slice.columns if "embedding" not in c]]
     df_scored["cosine_distance"] = cos_dist
     df_scored["knn_distance"] = knn_dist
+    # Fixed-k variant: the adaptive k = clamp(√n) above makes knn_distance
+    # systematically smaller in dense (large) slices and larger in small ones,
+    # so pooling its per-slice medians into one class null mixed incomparable
+    # scales — small slices got inflated knn_abs_z.  The calibration layer
+    # therefore uses this size-independent variant instead.
+    df_scored["knn_distance_fixed"] = knn_dist_fixed
     df_scored["neighbourhood_offset"] = neighbourhood_offset
     df_scored["cos_norm"] = cos_norm
     df_scored["knn_norm"] = knn_norm

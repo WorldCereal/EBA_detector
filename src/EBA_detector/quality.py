@@ -210,11 +210,34 @@ def assert_h3_matches_coordinates(
     if len(sub) > sample_n:
         sub = sub.sample(n=sample_n, random_state=seed)
 
+    def _norm_cell(c) -> str:
+        """Normalise an H3 cell to its lowercase hex-string form.
+
+        Caches may store cells either as hex strings ('831f9d...') or as raw
+        uint64 integers (both representations exist in the wild).  Comparing
+        ``str(int_cell)`` against the hex string from ``latlng_to_cell`` gave a
+        100 % "mismatch" on a perfectly consistent int-encoded cache — and a
+        hard error under strict mode.
+        """
+        if isinstance(c, (int, np.integer)):
+            try:
+                return str(_h3.int_to_str(int(c))).lower()
+            except (ValueError, OverflowError):
+                return str(c).lower()
+        s = str(c).strip().lower()
+        # An all-digit string is almost certainly a stringified int cell.
+        if s.isdigit():
+            try:
+                return str(_h3.int_to_str(int(s))).lower()
+            except (ValueError, OverflowError):
+                return s
+        return s
+
     expected = [
-        _h3.latlng_to_cell(float(la), float(lo), int(resolution))
+        str(_h3.latlng_to_cell(float(la), float(lo), int(resolution))).lower()
         for la, lo in zip(sub[lat_col].to_numpy(), sub[lon_col].to_numpy())
     ]
-    actual = [str(c) for c in sub[h3_col].to_numpy()]
+    actual = [_norm_cell(c) for c in sub[h3_col].to_numpy()]
     mismatch = float(np.mean([e != a for e, a in zip(expected, actual)]))
 
     if mismatch > float(tolerance):

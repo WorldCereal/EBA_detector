@@ -107,6 +107,7 @@ def compute_null_reference(
     slice_key_cols: Sequence[str],
     metric_cols: Sequence[str] = (
         "cosine_distance",
+        "knn_distance_fixed",
         "knn_distance",
         "neighbourhood_offset",
     ),
@@ -163,6 +164,14 @@ def compute_null_reference(
     null_keys = list(null_keys)
     slice_key_cols = list(slice_key_cols)
     metric_cols = [c for c in metric_cols if c in df_scores.columns]
+    # The adaptive-k knn_distance shrinks with slice size (k = clamp(√n), and
+    # denser/larger slices have smaller neighbour distances), so pooling its
+    # per-slice medians mixes incomparable scales and inflates the abs_z of
+    # SMALL slices.  When the size-independent fixed-k variant is present it
+    # replaces the adaptive one; knn_distance remains only as a fallback for
+    # legacy scored frames that predate knn_distance_fixed.
+    if "knn_distance_fixed" in metric_cols and "knn_distance" in metric_cols:
+        metric_cols = [c for c in metric_cols if c != "knn_distance"]
     if not metric_cols:
         raise ValueError(
             "compute_null_reference: none of the requested metric_cols are present"
@@ -271,6 +280,7 @@ def add_absolute_scores(
     null_keys: Sequence[str],
     metric_cols: Sequence[str] = (
         "cosine_distance",
+        "knn_distance_fixed",
         "knn_distance",
         "neighbourhood_offset",
     ),
@@ -326,6 +336,9 @@ def add_absolute_scores(
         for m in metric_cols
         if m in df_scores.columns and f"{m}_null_loc" in null_ref.columns
     ]
+    # Prefer the size-independent fixed-k metric; see compute_null_reference.
+    if "knn_distance_fixed" in metric_cols and "knn_distance" in metric_cols:
+        metric_cols = [m for m in metric_cols if m != "knn_distance"]
     if not metric_cols:
         raise ValueError(
             "add_absolute_scores: no metric is present in both df_scores and null_ref"
@@ -361,6 +374,7 @@ def add_absolute_scores(
     prefix_for = {
         "cosine_distance": "cos",
         "knn_distance": "knn",
+        "knn_distance_fixed": "knn",
         "neighbourhood_offset": "nbr",
     }
     if tuple(out_prefixes) == _DEFAULT_PREFIXES:
@@ -440,6 +454,20 @@ def add_absolute_scores(
     abs_z = np.where(all_nan, np.nan, abs_z)
 
     out["abs_z"] = abs_z.astype(np.float32)
+    # How many of the (centroid, neighbourhood) terms were actually finite.
+    # Under combine="min" a row with only one finite term silently degrades to
+    # single-metric evidence — the "must agree on both" guarantee no longer
+    # holds for it.  Recording the count makes that degradation auditable
+    # instead of invisible.
+    out["abs_z_n_terms"] = np.isfinite(terms).sum(axis=1).astype(np.int8)
+    if combine == "min":
+        _n_degraded = int(((out["abs_z_n_terms"].to_numpy() == 1)).sum())
+        if _n_degraded:
+            print(
+                f"[calibration] NOTE: {_n_degraded:,} rows have only one finite "
+                "abs_z term; combine='min' is single-metric evidence for them "
+                "(see abs_z_n_terms)."
+            )
 
     # Retain the null *scale* of the primary metric.  ``flag_anomalies``'s
     # ``stable_mad`` mode uses it as the dispersion for the within-slice test,

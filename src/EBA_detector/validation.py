@@ -225,7 +225,8 @@ def score_embeddings_df(
         if len(g) < int(min_scoring_slice_size):
             for c in ["S", "mean_score", "rank_percentile",
                       "S_rank", "S_rank_min", "S_z",
-                      "cosine_distance", "knn_distance", "neighbourhood_offset"]:
+                      "cosine_distance", "knn_distance",
+                      "knn_distance_fixed", "neighbourhood_offset"]:
                 g[c] = np.nan
             results.append(g[[col for col in g.columns if "embedding" not in col
                               and col != "centroid"]])

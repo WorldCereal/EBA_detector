@@ -267,6 +267,11 @@ class AnomalyRunConfig:
     abs_z_suspect: float = 4.0
     abs_z_candidate: float = 5.5
     abs_combine: str = "min"
+    # Extra columns conditioning the cross-slice null (e.g. a continent or
+    # year column) when distance scales differ systematically between them.
+    # Without this the null pools per class only, so classes spanning
+    # heterogeneous regions get a regional false-positive bias.
+    null_extra_keys: Optional[List[str]] = None
     # --- support / quality ------------------------------------------------
     min_scoring_slice_size: int = 50
     quality_gate: bool = True
@@ -801,6 +806,7 @@ def run_single_domain_scoring(
             abs_z_suspect=config.abs_z_suspect,
             abs_z_candidate=config.abs_z_candidate,
             abs_combine=config.abs_combine,
+            null_extra_keys=config.null_extra_keys,
             min_scoring_slice_size=config.min_scoring_slice_size,
             quality_gate=config.quality_gate,
             strict_quality=config.strict_quality,
@@ -1939,6 +1945,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                       choices=["min", "max", "mean"],
                       help=("How to combine the centroid-distance and kNN-distance "
                             "z-scores. 'min' (default) demands both."))
+    absg.add_argument(
+        "--null-extra-keys", type=str, nargs="*", default=None,
+        help=("Extra columns conditioning the cross-slice null beyond the "
+              "label class (e.g. a continent or year column). Use when "
+              "legitimate distance scales differ systematically between "
+              "regions/periods, otherwise heterogeneous regions inherit a "
+              "false-positive bias from the pooled null."))
     absg.add_argument("--purity-veto", type=float, default=0.80,
                       help=("Cap escalation at 'flagged' when this fraction of a "
                             "point's neighbours share its label. Set 1.1 to disable."))
@@ -2061,6 +2074,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         abs_z_suspect=args.abs_z_suspect,
         abs_z_candidate=args.abs_z_candidate,
         abs_combine=args.abs_combine,
+        null_extra_keys=list(args.null_extra_keys) if args.null_extra_keys else None,
         purity_veto=args.purity_veto,
         min_scoring_slice_size=args.min_scoring_slice_size,
         quality_gate=not bool(args.no_quality_gate),

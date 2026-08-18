@@ -280,10 +280,12 @@ def _assign_anomaly_categories(
     purity_candidate_max: float = 0.35,
     purity_veto: float = 0.80,
     margin_suspect_max: float = 0.0,
+    margin_candidate_max: float = 0.0,
     rank_suspect_min: float = 0.98,
     rank_candidate_min: float = 0.995,
     suspect_votes: int = 2,
     candidate_votes: int = 3,
+    require_absolute: bool = True,
 ) -> pd.DataFrame:
     """Assign ``S_anomaly`` and ``combined_anomaly`` escalation categories.
 
@@ -383,14 +385,23 @@ def _assign_anomaly_categories(
     votes_candidate = (
         (abs_z >= abs_z_candidate).astype(int)
         + (purity_known & (purity <= purity_candidate_max)).astype(int)
-        + (margin_known & (margin <= margin_suspect_max)).astype(int)
+        + (margin_known & (margin <= margin_candidate_max)).astype(int)
         + (s_rank >= rank_candidate_min).astype(int)
     )
 
     # The absolute vote is mandatory for escalation: without a cross-slice
     # scale there is no way to tell "worst in a clean slice" from "wrong".
-    abs_ok_suspect = abs_z >= abs_z_suspect
-    abs_ok_candidate = abs_z >= abs_z_candidate
+    # With require_absolute=False (the legacy / ablation mode requested by
+    # run_pipeline) the mandatory gate is lifted here as well — previously the
+    # flag stage honoured the switch but escalation kept demanding abs_z, so
+    # "--no-absolute-gate" was not the clean relative-only ablation it claimed
+    # to be.  The abs_z *vote* still counts when the score is present.
+    if require_absolute:
+        abs_ok_suspect = abs_z >= abs_z_suspect
+        abs_ok_candidate = abs_z >= abs_z_candidate
+    else:
+        abs_ok_suspect = np.ones(n, dtype=bool)
+        abs_ok_candidate = np.ones(n, dtype=bool)
 
     flagged_df.loc[
         is_flagged & abs_ok_suspect & (votes_suspect >= suspect_votes), combined
@@ -1112,7 +1123,12 @@ def run_pipeline(
     # phenology rather than by a wrong label.
     if time_keys:
         tk = time_keys[0]
-        spatial_context_cols = [*group_cols, context_cell]
+        # The denominator MUST be the numerator's grouping minus the time key
+        # (i.e. context_group_cols + context cell), NOT group_cols.  Using
+        # group_cols=["ref_id"] here while the numerator used the geographic
+        # context made the two counts refer to different populations, so the
+        # "fraction" could go negative whenever several datasets shared a cell.
+        spatial_context_cols = [*context_group_cols, context_cell]
         ctx_size = df.groupby(spatial_context_cols, dropna=False)[tk].transform("size")
         same_period = df.groupby(context_cols, dropna=False)[tk].transform("size")
         df["time_minority_frac"] = (
@@ -1254,11 +1270,17 @@ def run_pipeline(
         _z_equiv = suggest_abs_z_threshold(
             scored_df, target_flag_fraction=0.02, scored_mask_col="scored"
         )
-        _over = float(np.nanmean(scored_df["abs_z"].to_numpy() >= abs_z_k))
+        # Report exceedance over the SCORED population only; unscored rows
+        # carry NaN abs_z and counting them deflated the printed percentage.
+        _sc = scored_df["scored"].fillna(False).to_numpy(dtype=bool)
+        _z_sc = scored_df.loc[_sc, "abs_z"].to_numpy(dtype="float64")
+        # NaN abs_z (degenerate null) counts as "does not exceed".
+        with np.errstate(invalid="ignore"):
+            _over = float(np.mean(_z_sc >= abs_z_k)) if _z_sc.size else float("nan")
         print(
             f"[anomaly] abs_z gate = {abs_z_k} sigma "
             f"(a flat 2% budget would correspond to z = {_z_equiv:.2f}); "
-            f"{_over:.2%} of rows exceed the gate before the within-slice test"
+            f"{_over:.2%} of scored rows exceed the gate before the within-slice test"
         )
 
     # ------------------------------------------------------------------
@@ -1348,6 +1370,7 @@ def run_pipeline(
         abs_z_suspect=abs_z_suspect,
         abs_z_candidate=abs_z_candidate,
         purity_veto=purity_veto,
+        require_absolute=require_absolute,
     )
 
     # ------------------------------------------------------------------
