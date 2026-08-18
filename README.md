@@ -13,7 +13,7 @@ This repository accompanies the paper **"Embeddings-based Anomaly Detection for 
 Crop-Type Reference Datasets"** ([arXiv:2607.23908](https://arxiv.org/abs/2607.23908), [HTML](https://arxiv.org/html/2607.23908v1), [PDF](https://arxiv.org/pdf/2607.23908))
 
 ## News: 
-Accepted for spotlight oral presentation at **[TerraBytes II](https://terrabytes-workshop.github.io/spotlight)** workshop at ECCV 2026, Malmö, Sweden. (see [Citation](#citation)).
+Accepted for spotlight oral presentation at **[TerraBytes II](https://terrabytes-workshop.github.io)** workshop at ECCV 2026, Malmö, Sweden. (see [Citation](#citation)).
 
 ---
 
@@ -227,7 +227,7 @@ If you use this code, please cite:
 }
 ```
 
-Accepted for spotlight oral presentation at **[TerraBytes II](https://terrabytes-workshop.github.io/spotlight)** workshop at ECCV 2026, Malmö, Sweden.
+Accepted for spotlight oral presentation at **[TerraBytes II](https://terrabytes-workshop.github.io)** workshop at ECCV 2026, Malmö, Sweden.
 
 ---
 
