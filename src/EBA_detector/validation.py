@@ -54,6 +54,7 @@ from .anomaly_utils import (
     compute_slice_centroids,
     flag_anomalies,
 )
+from .calibration import add_absolute_scores, compute_null_reference
 from .robust_extensions import (
     apply_trust_to_confidence,
     compute_slice_trust,
@@ -102,7 +103,7 @@ def inject_label_noise(
     """
     rng = np.random.RandomState(spec.seed)
     out = df.copy().reset_index(drop=True)
-    labels = out[spec.label_col].astype(object).to_numpy()
+    labels = out[spec.label_col].astype(object).to_numpy(copy=True)
     noisy = labels.copy()
     truth = np.zeros(len(out), dtype=bool)
 
@@ -171,17 +172,21 @@ def score_embeddings_df(
     h3_col: str = "h3_l3_cell",
     group_cols: Sequence[str] = (),
     embedding_col: str = "embedding",
-    threshold_mode: str = "mad",
-    mad_k: float = 4.0,
+    threshold_mode: str = "stable_mad",
+    mad_k: float = 3.0,
     percentile_q: float = 0.96,
     max_flagged_fraction: Optional[float] = None,
     norm_percentiles: Tuple[float, float] = (2.0, 98.0),
     centroid_mode: str = "trimmed",
-    centroid_trim: float = 0.05,
+    centroid_trim: float = 0.20,
     max_full_pairwise_n: Optional[int] = 0,
     gate_confidence_by_flag: bool = True,
     apply_slice_trust: bool = False,
     slice_trust_min: float = 0.05,
+    require_absolute: bool = True,
+    abs_z_k: float = 3.0,
+    abs_combine: str = "min",
+    min_scoring_slice_size: int = MIN_SCORING_SLICE_SIZE,
 ) -> pd.DataFrame:
     """Run the core scoring → flag → confidence → trust chain on a pre-loaded
     embeddings DataFrame.
@@ -217,10 +222,11 @@ def score_embeddings_df(
     for _, g in df_c.groupby(slice_keys, group_keys=False):
         g = g.copy()
         g["slice_n"] = len(g)
-        if len(g) < MIN_SCORING_SLICE_SIZE:
+        if len(g) < int(min_scoring_slice_size):
             for c in ["S", "mean_score", "rank_percentile",
-                      "S_rank", "S_rank_min", "S_z"]:
-                g[c] = 0.0
+                      "S_rank", "S_rank_min", "S_z",
+                      "cosine_distance", "knn_distance", "neighbourhood_offset"]:
+                g[c] = np.nan
             results.append(g[[col for col in g.columns if "embedding" not in col
                               and col != "centroid"]])
             continue
@@ -240,7 +246,33 @@ def score_embeddings_df(
     # Rows in slices too small to define a centroid are never scored by the
     # production pipeline (they keep confidence 1.0); mark them so detection
     # metrics can be restricted to the population the detector operates on.
-    scored_df["scored"] = scored_df["slice_n"] >= MIN_SCORING_SLICE_SIZE
+    scored_df["scored"] = scored_df["slice_n"] >= int(min_scoring_slice_size)
+
+    # 2b. absolute-scale calibration
+    #
+    # This MUST mirror what run_pipeline does.  Validating a detector whose
+    # flag rule differs from the shipped one measures a different detector, and
+    # the reported AUROC / precision then does not describe what actually runs.
+    n_scorable = int(scored_df["scored"].fillna(False).astype(bool).sum())
+    if (require_absolute or threshold_mode == "stable_mad") and n_scorable == 0:
+        # Mirror run_pipeline: no slice is large enough to calibrate on is a
+        # legitimate (if uninformative) outcome, not a crash.  Previously any
+        # sweep that produced only small slices aborted the whole run.
+        scored_df["abs_z"] = np.nan
+        scored_df["cos_abs_z"] = np.nan
+        scored_df["neighbour_abs_z"] = np.nan
+        scored_df["null_scale_sigma"] = np.nan
+    elif require_absolute or threshold_mode == "stable_mad":
+        null_ref = compute_null_reference(
+            scored_df,
+            null_keys=[label_col],
+            slice_key_cols=slice_keys,
+            min_slice_n=max(int(min_scoring_slice_size), 30),
+            scored_mask_col="scored",
+        )
+        scored_df = add_absolute_scores(
+            scored_df, null_ref, null_keys=[label_col], combine=abs_combine
+        )
 
     # 3. flagging
     flagged_df, _summary = flag_anomalies(
@@ -252,6 +284,9 @@ def score_embeddings_df(
         percentile_q=percentile_q,
         mad_k=mad_k,
         max_flagged_fraction=max_flagged_fraction,
+        abs_z_k=abs_z_k,
+        require_absolute=require_absolute,
+        scored_mask_col="scored",
     )
 
     # 4. confidence (flag-gated)
@@ -319,6 +354,21 @@ def evaluate_detection(
     # slices too small to define a centroid are never assigned a score in
     # production (they keep confidence 1.0), so counting them as missed
     # detections would unfairly deflate ranking metrics.
+    # Report the blind spot rather than hiding it.  Restricting to the scored
+    # population is defensible for *ranking* metrics, but on its own it makes
+    # the detector look better than it is in deployment: the excluded rows are
+    # real reference samples that receive no scrutiny at all.  Both numbers are
+    # emitted so a reader can see the gap.
+    n_all = len(scored_df)
+    if scored_col in scored_df.columns:
+        n_scorable = int(scored_df[scored_col].fillna(False).astype(bool).sum())
+        y_all = scored_df[truth_col].fillna(False).to_numpy(dtype=bool)
+        missed_unscored = int(
+            (y_all & ~scored_df[scored_col].fillna(False).to_numpy(dtype=bool)).sum()
+        )
+    else:
+        n_scorable, missed_unscored = n_all, 0
+
     if restrict_to_scored and scored_col in scored_df.columns:
         scored_df = scored_df[scored_df[scored_col].fillna(False).astype(bool)]
 
@@ -331,6 +381,11 @@ def evaluate_detection(
         "n": int(n),
         "n_corrupt": n_corrupt,
         "base_rate": float(n_corrupt / n) if n else float("nan"),
+        # Coverage: how much of the population the detector can even look at,
+        # and how many planted errors sit in that blind spot.
+        "n_population": int(n_all),
+        "scorable_fraction": float(n_scorable / n_all) if n_all else float("nan"),
+        "n_corrupt_unscorable": int(missed_unscored),
     }
 
     if n_corrupt == 0 or n_corrupt == n:

@@ -65,6 +65,7 @@ CTY24_ANOMALY_COLUMNS: List[str] = [
 _SCORE_COLS: List[str] = [
     "cosine_distance",
     "knn_distance",
+    "neighbourhood_offset",
     "cos_norm",
     "knn_norm",
     "S",
@@ -113,9 +114,20 @@ def robust_centroid(
     mode: str = "trimmed",
     trim_frac: float = 0.05,
     n_iter: int = 2,
+    normalize: bool = True,
 ) -> np.ndarray:
     """Compute a centroid that resists contamination by the very outliers we
     are trying to detect.
+
+    .. note:: **Spherical mean.**  Every distance in this package is a *cosine*
+       distance, but the historical implementation averaged the **raw**
+       vectors, so the reference point was pulled toward whichever samples
+       happened to have the largest L2 norm rather than toward the angular
+       centre of the cloud.  With ``normalize=True`` (the default) the
+       embeddings are L2-normalised before averaging, which is the correct
+       centroid for cosine geometry and matches what
+       :func:`EBA_detector.robust_extensions.compute_slice_trust` already did.
+       Pass ``normalize=False`` for the legacy Euclidean behaviour.
 
     The plain mean is *masked* by outliers: with a 10 % contamination rate the
     mean is pulled toward the anomalous mass, which deflates the cosine
@@ -152,18 +164,25 @@ def robust_centroid(
     if n == 0:
         raise ValueError("Cannot compute a centroid of an empty slice")
 
-    if mode == "mean" or n < 5:
-        return X.mean(axis=0)
+    if mode not in {"mean", "median", "trimmed"}:
+        raise ValueError("centroid mode must be one of {'mean','median','trimmed'}")
+
+    if normalize:
+        X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
+
+    # Below n == 3 a trimmed estimate has no room to trim; fall back to the
+    # plain mean.  (The previous cut-off of 5 silently disabled robustification
+    # on slices small enough that a single contaminant dominates, which is
+    # exactly where it was needed most.)
+    if mode == "mean" or n < 3:
+        return X.mean(axis=0).astype(np.float32, copy=False)
 
     if mode == "median":
         return np.median(X, axis=0).astype(np.float32, copy=False)
 
-    if mode != "trimmed":
-        raise ValueError("centroid mode must be one of {'mean','median','trimmed'}")
-
     trim_frac = float(np.clip(trim_frac, 0.0, 0.49))
     centroid = X.mean(axis=0)
-    keep_n = max(int(np.ceil((1.0 - trim_frac) * n)), 3)
+    keep_n = min(max(int(np.ceil((1.0 - trim_frac) * n)), 3), n)
     for _ in range(max(int(n_iter), 1)):
         c_norm = centroid / (np.linalg.norm(centroid) + 1e-12)
         Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
@@ -460,22 +479,29 @@ def assign_adaptive_h3_level(
             # No max_slice_size cap — every point must be assigned somewhere.
             resolve_keys = set(counts.index.tolist())
         else:
-            # Only push slices to a finer level if they are TOO BIG
-            # (> max_slice_size). These will naturally split into smaller
-            # sub-cells at a finer resolution.
+            # Push a slice to a finer level only when it is TOO BIG
+            # (> max_slice_size); it will split into smaller sub-cells there.
             #
-            # Slices that are too SMALL (< min_slice_size) are resolved HERE
-            # at the current (coarser) level — going finer would only make
-            # them smaller still. merge_small_slices will absorb them into
-            # neighbouring cells afterwards.
+            # A slice that is too SMALL (< min_slice_size) is resolved HERE at
+            # the current (coarser) level — going finer would only shrink it
+            # further.  ``merge_small_slices`` absorbs the remainder afterwards.
             #
-            # So: resolve everything EXCEPT slices that exceed max_slice_size.
-            if max_slice_size is not None:
-                resolve_keys = set(
-                    counts[counts <= max_slice_size].index.tolist()
+            # ``min_slice_size`` is used to *report* how many slices are being
+            # resolved below the target support.  It was previously accepted,
+            # documented at length in both this docstring and run_pipeline's,
+            # and then never referenced in the body — so tuning it appeared to
+            # do nothing.  It now drives the diagnostic below.  (Slices that
+            # stay undersized after merging are marked by ``merge_small_slices``
+            # via ``undersized_slice``, which is what downstream consumes.)
+            keep = counts <= max_slice_size if max_slice_size is not None else counts == counts
+            resolve_keys = set(counts[keep].index.tolist())
+            n_below_min = int((counts[keep] < int(min_slice_size)).sum())
+            if n_below_min:
+                print(
+                    f"[adaptive_h3]   L{lvl}: {n_below_min} slices resolved below "
+                    f"min_slice_size={min_slice_size} (will be merged or marked "
+                    "undersized)"
                 )
-            else:
-                resolve_keys = set(counts.index.tolist())
 
         if not resolve_keys:
             if not is_finest:
@@ -540,16 +566,52 @@ def merge_small_slices(
     max_iterations: int = 25,
     min_improvement: float = 0.05,
     mark_undersized: bool = True,
+    context_col: str = "context_h3_cell",
 ) -> pd.DataFrame:
     """Merge small slices with neighbouring H3 cells until they exceed *min_size*.
 
     A "slice" is defined by: ``group_cols + [label_col] + [h3_level_name]``.
+
+    Context preservation (*context_col*)
+    ------------------------------------
+    Merging is decided **per (group, label, cell)**, so maize in cell X can be
+    relocated to cell Y while wheat in cell X stays put.  That is the right
+    granularity for finding enough same-class support, but it destroys the
+    meaning of the *cell* as a geographic neighbourhood — and the cell is
+    exactly what the context metrics (``add_alt_class_centroid_metrics``,
+    ``add_knn_label_purity_for_flagged``, ``compute_slice_trust``) group by.
+    After merging, "the other classes near me" became an arbitrary,
+    label-dependent set, so the alt-class margin and the kNN purity were not
+    measuring what their docstrings claimed.
+
+    This function therefore snapshots the **pre-merge** cell into *context_col*
+    and leaves it untouched.  Callers should key scoring on *h3_level_name*
+    (post-merge, class support) and every context metric on *context_col*
+    (pre-merge, genuine neighbourhood).
+
+    Merge policy
+    ------------
+    * A merge is only accepted when the target actually contributes points
+      (``best_count > 0``) **and** the merged slice is closer to *min_size*.
+    * Targets are restricted to cells present in the data and to the same or a
+      coarser resolution, so a merge never invents an empty cell.
+    * Candidate ordering is deterministic (count desc, then cell id) so the
+      same input always produces the same merge map.
+    * ``merge_steps`` records how many hops each row was moved, so a slice
+      assembled from four cells three hops away is visible downstream rather
+      than looking identical to an untouched one.
     """
     import h3 as _h3
 
     df = df.copy()
     group_cols = list(group_cols or [])
     key_cols = [*group_cols, label_col, h3_level_name]
+
+    # Snapshot the pre-merge cell: this is the stable geographic neighbourhood
+    # that every context metric must be computed on.
+    if context_col not in df.columns:
+        df[context_col] = df[h3_level_name].astype(str)
+    df["merge_steps"] = np.uint8(0)
 
     # Pre-compute H3 neighbours for all cells present.
     #
@@ -608,13 +670,20 @@ def merge_small_slices(
             if not neighbours:
                 continue
 
-            best_target = None
-            best_count = 0
-            for n in neighbours:
-                c = int(counts.get((*group_vals, label_value, n), 0))
-                if c > best_count:
-                    best_count = c
-                    best_target = n
+            # Deterministic candidate ordering: most same-label support first,
+            # ties broken by cell id.  Without the id tie-break the chosen
+            # target depended on dict/set iteration order, so two runs over the
+            # same data could build different slices and emit different flags.
+            scored_neighbours = sorted(
+                (
+                    (int(counts.get((*group_vals, label_value, nb), 0)), str(nb))
+                    for nb in neighbours
+                ),
+                key=lambda t: (-t[0], t[1]),
+            )
+            best_count, best_target = (
+                scored_neighbours[0] if scored_neighbours else (0, None)
+            )
 
             if best_target is not None and best_count > 0:
                 merge_rows.append((*group_vals, label_value, cell, best_target))
@@ -630,6 +699,9 @@ def merge_small_slices(
         mask = df["target_cell"].notna()
         if mask.any():
             df.loc[mask, h3_level_name] = df.loc[mask, "target_cell"].astype(str)
+            df.loc[mask, "merge_steps"] = (
+                df.loc[mask, "merge_steps"].to_numpy(dtype=np.int16) + 1
+            ).astype(np.uint8)
         df = df.drop(columns=["target_cell"], errors="ignore")
 
         # Recompute counts and check improvement
@@ -733,6 +805,7 @@ def compute_scores_for_slice(
 
     use_knn_only = force_knn or (max_full_pairwise_n is not None and n > max_full_pairwise_n)
 
+    neigh_idx: Optional[np.ndarray] = None
     if k <= 0:
         knn_dist = np.zeros(n, dtype=np.float32)
     elif use_knn_only:
@@ -744,19 +817,48 @@ def compute_scores_for_slice(
             n_jobs=-1,
         )
         nn.fit(embeddings)
-        distances, _ = nn.kneighbors(embeddings)
+        distances, neigh = nn.kneighbors(embeddings)
         knn_dist = distances[:, 1:].mean(axis=1).astype(np.float32, copy=False)
+        neigh_idx = neigh[:, 1:]
     else:
         # Full pairwise NxN (more memory intensive)
         dist_matrix = _cosine_distance_matrix(embeddings)
         np.fill_diagonal(dist_matrix, np.inf)
+        part = np.argpartition(dist_matrix, k, axis=1)[:, :k]
         knn_dist = (
-            np.partition(dist_matrix, k, axis=1)[:, :k]
+            np.take_along_axis(dist_matrix, part, axis=1)
             .mean(axis=1)
             .astype(np.float32, copy=False)
         )
+        neigh_idx = part
 
     knn_dist = np.nan_to_num(knn_dist, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # --- neighbourhood offset ------------------------------------------
+    # A *small* kNN distance is normally evidence that a point is an inlier.
+    # That inference breaks when the errors are coherent: a group of samples
+    # mislabelled the same way (one dataset digitised against the wrong legend,
+    # one region, one season) forms a dense cluster, so each member finds its
+    # fellow errors as nearest neighbours and looks perfectly supported.  This
+    # is the classic *masking* problem, and it is why the detector's recall
+    # collapsed exactly where contamination was worst.
+    #
+    # ``neighbourhood_offset`` asks a different question: where does the
+    # point's own neighbourhood sit relative to the class centroid?  For a
+    # genuine inlier it sits on the centroid (offset ~ 0).  For a member of a
+    # coherent wrong cluster it sits far away (offset large) even though its
+    # kNN distance is tiny.  Downstream this stops a self-consistent error
+    # cluster from vetoing the centroid evidence.
+    if neigh_idx is not None and neigh_idx.size:
+        emb_n = embeddings / (
+            np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12
+        )
+        nbr_mean = emb_n[neigh_idx].mean(axis=1)
+        nbr_mean /= np.linalg.norm(nbr_mean, axis=1, keepdims=True) + 1e-12
+        c_norm = centroid / (np.linalg.norm(centroid) + 1e-12)
+        neighbourhood_offset = (1.0 - (nbr_mean @ c_norm)).astype(np.float32)
+    else:
+        neighbourhood_offset = np.zeros(n, dtype=np.float32)
 
     # Percentile-based normalization
     cos_norm = _normalize_percentile_minmax(cos_dist, norm_percentiles=norm_percentiles)
@@ -780,6 +882,7 @@ def compute_scores_for_slice(
     df_scored = df_slice.copy()[[c for c in df_slice.columns if "embedding" not in c]]
     df_scored["cosine_distance"] = cos_dist
     df_scored["knn_distance"] = knn_dist
+    df_scored["neighbourhood_offset"] = neighbourhood_offset
     df_scored["cos_norm"] = cos_norm
     df_scored["knn_norm"] = knn_norm
     df_scored["S"] = scores
@@ -808,17 +911,28 @@ def _score_group_simple(
     max_full_pairwise_n: Optional[int],
     centroid_mode: str = "trimmed",
     centroid_trim: float = 0.10,
+    min_scoring_slice_size: int = MIN_SCORING_SLICE_SIZE,
+    centroid: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
-    """Score a single group, returning zero scores when the slice is too small."""
-    if len(g) < MIN_SCORING_SLICE_SIZE:
+    """Score a single group; mark it *unscored* when the slice is too small.
+
+    Slices below *min_scoring_slice_size* previously received ``0.0`` in every
+    score column, which is indistinguishable downstream from "we looked and it
+    is fine".  They now carry ``scored = False`` so the caller can emit an
+    explicit ``unscored`` flag state instead of ``normal`` — the detector's
+    blind spot becomes visible rather than being silently recorded as a clean
+    bill of health.
+    """
+    if len(g) < int(min_scoring_slice_size):
         g = g.copy()
         for c in _SCORE_COLS:
-            g[c] = 0.0
+            g[c] = np.nan
+        g["scored"] = False
         return g
 
-    return compute_scores_for_slice(
+    out = compute_scores_for_slice(
         g,
-        centroid=None,  # computed inside
+        centroid=centroid,  # computed inside when None
         norm_percentiles=norm_percentiles,
         max_full_pairwise_n=max_full_pairwise_n,
         force_knn=False,
@@ -826,6 +940,8 @@ def _score_group_simple(
         centroid_mode=centroid_mode,
         centroid_trim=centroid_trim,
     )
+    out["scored"] = True
+    return out
 
 
 def _add_hierarchical_ref_outlier_class(
@@ -897,8 +1013,17 @@ def _add_hierarchical_ref_outlier_class(
     df[out_ref_level_col] = ref_level
 
     # ref_outlier_class and ref_group_n
-    ref_class = df[label_cols[0]].astype(object).to_numpy()
-    ref_n = df["slice_n"].to_numpy()
+    #
+    # NOTE: ``copy=True`` is required, not cosmetic.  ``Series.to_numpy()``
+    # returns a *view* on the underlying block for these dtypes, so the
+    # in-place assignments below used to write straight through into
+    # ``df[label_cols[0]]`` and ``df["slice_n"]``.  On pandas < 3 that silently
+    # corrupted the level-0 label column (which ``score_slices_hierarchical``
+    # then groups by, so the level-0 slices were built from mangled labels);
+    # on pandas >= 3 copy-on-write makes the view read-only and the whole
+    # hierarchical path raised "assignment destination is read-only".
+    ref_class = df[label_cols[0]].astype(object).to_numpy(copy=True)
+    ref_n = df["slice_n"].to_numpy(copy=True)
 
     for lvl, lc in enumerate(label_cols[1:], start=1):
         m = ref_level == lvl
@@ -925,11 +1050,36 @@ def score_slices_hierarchical(
     ref_class_col: str = "ref_outlier_class",
     centroid_mode: str = "trimmed",
     centroid_trim: float = 0.10,
+    min_scoring_slice_size: int = MIN_SCORING_SLICE_SIZE,
+    fallback_shrinkage_k: float = 30.0,
 ) -> pd.DataFrame:
     """Score points by level-0 slices, falling back to coarser label levels
     for undersized slices.
 
     Scores are written back ONLY for the original undersized-slice points.
+
+    Rare-class bias in the fallback (*fallback_shrinkage_k*)
+    -------------------------------------------------------
+    The fallback scores a point against **every** point in the cell sharing its
+    *coarser* label — e.g. rye is scored against the pooled "cereals" cloud,
+    which in a wheat-dominated cell is essentially the wheat cloud.  Rye is
+    then far from that centroid and its nearest neighbours are wheat, so it is
+    flagged for being *rare*, not for being *wrong*.  Every minority crop in
+    every mixed cell inherited this bias.
+
+    The reference centroid is now shrunk toward the point's own fine class::
+
+        lambda   = n_fine / (n_fine + fallback_shrinkage_k)
+        centroid = lambda * fine_centroid + (1 - lambda) * coarse_centroid
+
+    With plenty of same-fine-class support the reference is the fine centroid;
+    with almost none it degrades gracefully to the coarse one.  Set
+    ``fallback_shrinkage_k=0`` to score against the pure fine centroid, or a
+    very large value to restore the legacy pooled-coarse behaviour.
+
+    Fallback-scored rows keep ``ref_outlier_level > 0``, which the caller uses
+    to cap their escalation — a flag raised against a borrowed reference should
+    never reach ``candidate``.
     """
     from tqdm import tqdm
 
@@ -940,6 +1090,8 @@ def score_slices_hierarchical(
     for c in _SCORE_COLS:
         if c not in df.columns:
             df[c] = np.nan
+    if "scored" not in df.columns:
+        df["scored"] = False
 
     # Ensure slice_n exists (size of level-0 slice)
     slice_keys_v0 = [*group_cols, h3_level_name, label_cols[0]]
@@ -961,30 +1113,46 @@ def score_slices_hierarchical(
             [*group_cols, h3_level_name, label_cols[0], "sample_id", "embedding"]
         ].reset_index(drop=True)
 
-        scored0 = (
-            g0.groupby([*group_cols, h3_level_name, label_cols[0]], group_keys=False)
-            .progress_apply(
-                lambda g: _score_group_simple(
+        # Iterate groups explicitly rather than via groupby.apply: pandas 3
+        # no longer passes the grouping columns to the callback, and the old
+        # code depended on that (silently, behind a suppressed FutureWarning).
+        scored_parts = []
+        for _key, g in tqdm(
+            list(g0.groupby([*group_cols, h3_level_name, label_cols[0]], sort=True)),
+            desc="Scoring level-0 slices",
+        ):
+            scored_parts.append(
+                _score_group_simple(
                     g, norm_percentiles, max_full_pairwise_n,
                     centroid_mode=centroid_mode, centroid_trim=centroid_trim,
+                    min_scoring_slice_size=min_scoring_slice_size,
                 )
             )
-            .reset_index(drop=True)
-        )
+        scored0 = pd.concat(scored_parts, ignore_index=True)
         scored0 = scored0.set_index("sample_id", drop=False)
         df_idx.loc[scored0.index, _SCORE_COLS] = scored0[_SCORE_COLS].to_numpy()
+        df_idx.loc[scored0.index, "scored"] = scored0["scored"].to_numpy()
 
     # 2) Score fallback groups once, then write back only to target rows
     fallback = df_idx[df_idx[ref_level_col] > 0]
     if not fallback.empty:
-        fb_keys = [ref_level_col, *group_cols, h3_level_name, ref_class_col]
+        # NOTE: label_cols[0] is part of the key on purpose.  Without it, every
+        # fine class in the cell that fell back to the same coarse class landed
+        # in ONE group, so `target_set` was their union: the shrinkage centroid
+        # was a blend of all of them and `n_fine` was inflated.  A cell with 10
+        # rye + 10 barley + 500 wheat gave rye a rye/barley blended reference and
+        # lambda = 20/(20+k) instead of 10/(10+k) — reintroducing the very
+        # rare-class bias the shrinkage exists to remove.  The reference cloud is
+        # still the coarse class; only the shrinkage target is now per fine class.
+        fb_keys = [ref_level_col, *group_cols, h3_level_name, ref_class_col,
+                   label_cols[0]]
         target_map = fallback.groupby(fb_keys)["sample_id"].apply(list)
 
         for key, target_ids in tqdm(
             target_map.items(), total=len(target_map), desc="Scoring fallback ref groups"
         ):
             ref_level = int(key[0])
-            ref_class = key[-1]
+            ref_class = key[-2]   # coarse class (key[-1] is now the fine class)
             ref_label_col = label_cols[ref_level]
 
             # Build reference set mask on the FULL dataframe
@@ -1001,22 +1169,51 @@ def score_slices_hierarchical(
             if ref_df.empty:
                 continue
 
+            # --- shrinkage reference centroid --------------------------------
+            # Score the fallback rows against a centroid that leans on their
+            # own fine class as far as its support allows, instead of the
+            # pooled coarse cloud (which systematically penalises rare crops).
+            target_set = set(target_ids)
+            fine_mask = ref_df["sample_id"].isin(target_set).to_numpy()
+            coarse_emb = np.vstack(ref_df["embedding"].to_numpy()).astype(np.float32)
+            coarse_centroid = robust_centroid(
+                coarse_emb, mode=centroid_mode, trim_frac=centroid_trim
+            )
+            n_fine = int(fine_mask.sum())
+            if n_fine >= 2 and fallback_shrinkage_k >= 0:
+                fine_centroid = robust_centroid(
+                    coarse_emb[fine_mask], mode=centroid_mode, trim_frac=centroid_trim
+                )
+                lam = n_fine / (n_fine + float(fallback_shrinkage_k)) if (
+                    n_fine + fallback_shrinkage_k
+                ) > 0 else 1.0
+                centroid = lam * fine_centroid + (1.0 - lam) * coarse_centroid
+                centroid = (centroid / (np.linalg.norm(centroid) + 1e-12)).astype(
+                    np.float32
+                )
+            else:
+                centroid = coarse_centroid
+
             scored_ref = _score_group_simple(
                 ref_df, norm_percentiles, max_full_pairwise_n,
                 centroid_mode=centroid_mode, centroid_trim=centroid_trim,
+                min_scoring_slice_size=min_scoring_slice_size,
+                centroid=centroid,
             )
-            scored_ref = scored_ref[scored_ref["sample_id"].isin(target_ids)]
+            scored_ref = scored_ref[scored_ref["sample_id"].isin(target_set)]
             if scored_ref.empty:
                 continue
 
             scored_ref = scored_ref.set_index("sample_id", drop=False)
             df_idx.loc[scored_ref.index, _SCORE_COLS] = scored_ref[_SCORE_COLS].to_numpy()
+            df_idx.loc[scored_ref.index, "scored"] = scored_ref["scored"].to_numpy()
 
-    # Hard check: no NaNs in required scoring columns
-    if df_idx[_SCORE_COLS].isna().any().any():
-        bad = df_idx[df_idx[_SCORE_COLS].isna().any(axis=1)][
-            ["sample_id", ref_level_col, ref_class_col]
-        ].head(20)
+    # Rows in slices too small to score legitimately carry NaN and are marked
+    # scored=False.  Anything else with a NaN score is a genuine bug.
+    scored_mask = df_idx["scored"].fillna(False).to_numpy(dtype=bool)
+    bad_mask = scored_mask & df_idx[_SCORE_COLS].isna().any(axis=1).to_numpy()
+    if bad_mask.any():
+        bad = df_idx.loc[bad_mask, ["sample_id", ref_level_col, ref_class_col]].head(20)
         raise ValueError(
             f"Hierarchical scoring left NaNs in score columns. Example rows:\n{bad}"
         )
@@ -1443,112 +1640,256 @@ def flag_anomalies(
     fdr_alpha: float = 0.05,
     min_flagged_per_slice: Optional[int] = None,
     max_flagged_fraction: Optional[float] = None,
+    flag_score_col: str = "S",
+    abs_z_col: Optional[str] = "abs_z",
+    abs_z_k: Optional[float] = 3.0,
+    require_absolute: bool = True,
+    tie_break_cols: Optional[Sequence[str]] = None,
+    scored_mask_col: Optional[str] = "scored",
+    local_metric_col: str = "cosine_distance",
+    stable_scale_col: str = "null_scale_sigma",
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Flag anomalies within each slice group.
 
     Slice keys: ``group_cols + [h3_level_name] + [label_col]``.
+
+    The absolute gate (*abs_z_col*, *abs_z_k*, *require_absolute*)
+    ------------------------------------------------------------
+    The within-slice test alone cannot distinguish "the most unusual point in
+    a clean slice" from "a genuinely mislabelled point", because
+    ``flag_score_col`` is percentile-normalised **per slice** and therefore
+    spans the same range everywhere.  Worse, the ``median + k·MAD`` rule
+    evaluated on that bounded score is a knife-edge: on synthetic slices it
+    flags 0 % at both 2 % and 30 % true contamination (at 30 % the contaminant
+    inflates the slice's own median and MAD past the score ceiling) but 9 % at
+    10 %.
+
+    With ``require_absolute=True`` a point must **also** exceed *abs_z_k*
+    robust sigma against the cross-slice null from
+    :mod:`EBA_detector.calibration`.  That null is built from one summary
+    statistic per slice, so a contaminated slice cannot calibrate its own
+    errors away — which restores detection in the heavily-contaminated regime
+    while removing the fixed per-slice quota that produced false positives on
+    clean slices.
+
+    Set ``require_absolute=False`` (or ``abs_z_k=None``) for the legacy
+    relative-only behaviour, e.g. for ablations.
+
+    Determinism
+    -----------
+    Because ``S`` is min–max normalised and clipped, roughly 2–4 % of every
+    slice sits at exactly ``S == 1.0``.  Truncating that tied block with
+    *max_flagged_fraction* used to select arbitrarily among ties, so the
+    flagged set depended on row order and was not reproducible between runs or
+    between ``rerun`` and ``update`` mode.  Ordering now falls back through
+    *tie_break_cols* (default: ``abs_z`` then ``sample_id``).
     """
     group_cols = list(group_cols or [])
     group_keys = [*group_cols, h3_level_name, label_col]
-    flag_col = "S"
+    flag_col = flag_score_col
+    if flag_col not in df_scores.columns:
+        raise KeyError(f"flag_anomalies: missing score column {flag_col!r}")
 
-    def _flag_group(group: pd.DataFrame) -> pd.DataFrame:
-        g = group.copy()
-        if g.empty:
-            g["flagged"] = False
-            return g
+    if threshold_mode not in {"percentile", "mad", "stable_mad", "absolute", "fdr"}:
+        raise ValueError(
+            "threshold_mode must be one of "
+            "{'percentile','mad','stable_mad','absolute','fdr'}"
+        )
+    if threshold_mode == "stable_mad":
+        for c in (local_metric_col, stable_scale_col):
+            if c not in df_scores.columns:
+                raise KeyError(
+                    f"flag_anomalies: threshold_mode='stable_mad' needs {c!r}. "
+                    "Run EBA_detector.calibration.add_absolute_scores first."
+                )
+    if threshold_mode == "absolute" and abs_threshold is None:
+        raise ValueError("abs_threshold must be set when threshold_mode='absolute'")
 
-        g = g.sort_values(flag_col, ascending=False)
+    out = df_scores.reset_index(drop=True).copy()
+    n_rows = len(out)
+    flags = np.zeros(n_rows, dtype=bool)
+    thr_out = np.full(n_rows, np.nan, dtype=np.float64)
+
+    if n_rows == 0:
+        out["flagged"] = flags
+        out["flag_threshold"] = thr_out
+        summary = pd.DataFrame(
+            columns=[*group_keys, "total_samples", "flagged_samples", "flagged_fraction"]
+        )
+        return out, summary
+
+    # --- ordering used for tie-breaking and for the cap ---------------------
+    if tie_break_cols is None:
+        tie_break_cols = [c for c in (abs_z_col, "sample_id") if c and c in out.columns]
+    else:
+        tie_break_cols = [c for c in tie_break_cols if c in out.columns]
+
+    sort_cols = [flag_col, *tie_break_cols]
+    ascending = [False] + [False] * len(tie_break_cols)
+    # sample_id is an identifier, not a magnitude — sort it ascending so the
+    # tie-break is a stable lexical rule rather than a pseudo-score.
+    for i, c in enumerate(sort_cols):
+        if c == "sample_id":
+            ascending[i] = True
+    order_positions = (
+        out.sort_values(sort_cols, ascending=ascending, kind="mergesort")
+        .index.to_numpy()
+        .astype(np.int64)
+    )
+    # global_rank[i] = where row i sits in the deterministic descending order
+    global_rank = np.empty(n_rows, dtype=np.int64)
+    global_rank[order_positions] = np.arange(n_rows, dtype=np.int64)
+
+    rank_in_slice = np.zeros(n_rows, dtype=np.int64)
+
+    # --- absolute gate ------------------------------------------------------
+    if require_absolute and abs_z_col and abs_z_k is not None:
+        if abs_z_col not in out.columns:
+            raise KeyError(
+                f"flag_anomalies: require_absolute=True but {abs_z_col!r} is missing. "
+                "Run EBA_detector.calibration.add_absolute_scores first, or pass "
+                "require_absolute=False for legacy relative-only flagging."
+            )
+        abs_ok = (
+            pd.to_numeric(out[abs_z_col], errors="coerce").to_numpy(dtype="float64")
+            >= float(abs_z_k)
+        )
+        abs_ok = np.nan_to_num(abs_ok, nan=False).astype(bool)
+    else:
+        abs_ok = np.ones(n_rows, dtype=bool)
+
+    # Points the pipeline never actually scored must not be flagged.
+    if scored_mask_col and scored_mask_col in out.columns:
+        scorable = out[scored_mask_col].fillna(False).to_numpy(dtype=bool)
+    else:
+        scorable = np.ones(n_rows, dtype=bool)
+
+    values = pd.to_numeric(out[flag_col], errors="coerce").to_numpy(dtype="float64")
+
+    if threshold_mode == "stable_mad":
+        # Local reference, stable dispersion: the threshold is the slice's own
+        # median distance plus k times the *cross-slice* sigma.  The plain
+        # 'mad' mode instead divides by the slice's own MAD, which a
+        # contaminated slice inflates along with its median — that is why the
+        # legacy gate flagged 0 % at 30 % true contamination while flagging
+        # 9 % at 10 %.
+        local_values = pd.to_numeric(
+            out[local_metric_col], errors="coerce"
+        ).to_numpy(dtype="float64")
+        stable_scale = pd.to_numeric(
+            out[stable_scale_col], errors="coerce"
+        ).to_numpy(dtype="float64")
+    else:
+        local_values = values
+        stable_scale = None
+
+    # --- per-slice relative test (vectorised; no groupby.apply) -------------
+    #
+    # The previous implementation relied on ``groupby(...).apply()`` returning
+    # the grouping columns to the callback.  pandas deprecated that in 2.2 and
+    # removed it in 3.0 — and the resulting FutureWarning was explicitly
+    # suppressed in this function, so the breakage would have surfaced as
+    # changed *results*, not as an error.  Index-based assignment has no such
+    # dependency.
+    indices = out.groupby(group_keys, dropna=False, sort=False).indices
+
+    for _key, pos in indices.items():
+        pos = np.asarray(pos)
+        v = values[pos]
+        finite = np.isfinite(v)
+        if not finite.any():
+            rank_in_slice[pos] = 0
+            continue
+        n = len(pos)
+        thr = np.inf
 
         if threshold_mode == "percentile":
-            thr = g[flag_col].quantile(percentile_q)
-            g["flagged"] = g[flag_col] >= thr
+            thr = float(np.nanquantile(v, percentile_q))
         elif threshold_mode == "mad":
-            med = g[flag_col].median()
-            mad = (g[flag_col] - med).abs().median()
-            if mad > 0:
-                thr = med + mad_k * mad
-                g["flagged"] = g[flag_col] >= thr
-            else:
-                # Degenerate slice: MAD == 0 means > 50% of points share the
-                # same score, so there is no robust scale to threshold on.
-                # Previously this fell back to a magic constant (1.0) which,
-                # because S in [0, 1], silently flagged nothing — but would
-                # mis-behave on any other score range.  Be explicit instead:
-                # flag nothing when the robust scale collapses.
-                thr = float("inf")
-                g["flagged"] = False
-        elif threshold_mode == "absolute":
-            if abs_threshold is None:
-                raise ValueError(
-                    "abs_threshold must be set when threshold_mode='absolute'"
-                )
-            g["flagged"] = g[flag_col] >= float(abs_threshold)
-        elif threshold_mode == "fdr":
-            n = len(g)
-            ranks = g[flag_col].rank(ascending=False, method="max")
-            pvals = ranks / (n + 1.0)
-            order = np.argsort(pvals.to_numpy())
-            p_sorted = pvals.to_numpy()[order]
-            thresh = (np.arange(1, n + 1) / n) * fdr_alpha
-            passed = p_sorted <= thresh
-            if passed.any():
-                k = int(np.max(np.where(passed)))
-                p_cut = p_sorted[k]
-                g["flagged"] = pvals <= p_cut
-            else:
-                g["flagged"] = False
-        else:
-            raise ValueError(
-                "threshold_mode must be one of {'percentile','mad','absolute','fdr'}"
+            med = float(np.nanmedian(v))
+            mad = float(np.nanmedian(np.abs(v - med)))
+            # Degenerate slice: MAD == 0 means >50% of points share one score,
+            # so there is no robust scale to threshold on. Flag nothing.
+            thr = med + mad_k * mad if mad > 0 else np.inf
+        elif threshold_mode == "stable_mad":
+            lv = local_values[pos]
+            sl = stable_scale[pos]
+            # An all-NaN scale means the class null was degenerate (see
+            # calibration._DEGENERATE_SCALE); threshold at +inf, i.e. flag
+            # nothing, rather than dividing by a floored pseudo-scale.
+            med = float(np.nanmedian(lv)) if np.isfinite(lv).any() else np.nan
+            sigma = float(np.nanmedian(sl)) if np.isfinite(sl).any() else np.nan
+            thr = (
+                med + mad_k * sigma
+                if np.isfinite(med) and np.isfinite(sigma) and sigma > 0
+                else np.inf
             )
+        elif threshold_mode == "absolute":
+            thr = float(abs_threshold)
+        elif threshold_mode == "fdr":
+            r = pd.Series(v).rank(ascending=False, method="max").to_numpy()
+            pvals = r / (n + 1.0)
+            p_sorted = np.sort(pvals)
+            bh = (np.arange(1, n + 1) / n) * fdr_alpha
+            passed = p_sorted <= bh
+            thr = np.nan  # threshold expressed on p-values, recorded below
+            if passed.any():
+                p_cut = p_sorted[int(np.max(np.where(passed)))]
+                sel = pvals <= p_cut
+            else:
+                sel = np.zeros(n, dtype=bool)
 
-        n = len(g)
-        flags = g["flagged"].to_numpy().astype(bool)
-        n_flag = int(flags.sum())
+        if threshold_mode == "stable_mad":
+            lv = local_values[pos]
+            sel = np.where(np.isfinite(lv), lv >= thr, False)
+        elif threshold_mode != "fdr":
+            sel = np.where(finite, v >= thr, False)
+
+        thr_out[pos] = thr
+
+        # deterministic descending order inside this slice
+        local_order = np.argsort(global_rank[pos], kind="mergesort")
+        rank_in_slice[pos[local_order]] = np.arange(n)
+
+        sel = sel & abs_ok[pos] & scorable[pos]
+        n_flag = int(sel.sum())
 
         if max_flagged_fraction is not None:
-            max_allowed = int(np.floor(max_flagged_fraction * n))
-            if max_allowed < 0:
-                max_allowed = 0
+            max_allowed = max(int(np.floor(max_flagged_fraction * n)), 0)
             if n_flag > max_allowed:
-                if max_allowed == 0:
-                    flags[:] = False
-                else:
-                    flags[:] = False
-                    flags[:max_allowed] = True
-                n_flag = int(flags.sum())
+                keep = np.zeros(n, dtype=bool)
+                if max_allowed > 0:
+                    # keep the top `max_allowed` *flagged* points in the
+                    # deterministic order
+                    flagged_in_order = [i for i in local_order if sel[i]]
+                    keep[flagged_in_order[:max_allowed]] = True
+                sel = keep
+                n_flag = int(sel.sum())
 
         if min_flagged_per_slice is not None and min_flagged_per_slice > 0:
+            # Forcing a minimum manufactures flags in clean slices; only do it
+            # among points that pass the absolute gate, so a clean slice can
+            # still legitimately yield zero.
             if n_flag < min_flagged_per_slice:
-                k = min(min_flagged_per_slice, n)
-                flags[:] = False
-                flags[:k] = True
-                n_flag = int(flags.sum())
+                eligible = [
+                    i for i in local_order if abs_ok[pos[i]] and scorable[pos[i]]
+                ]
+                sel = np.zeros(n, dtype=bool)
+                sel[eligible[: min(min_flagged_per_slice, len(eligible))]] = True
 
-        g["flagged"] = flags
-        return g
+        flags[pos] = sel
 
-    import warnings as _warnings
-    with _warnings.catch_warnings():
-        _warnings.filterwarnings(
-            "ignore",
-            message="DataFrameGroupBy.apply operated on the grouping columns",
-            category=FutureWarning,
-        )
-        flagged_df = (
-            df_scores.groupby(group_keys, group_keys=False)
-            .apply(_flag_group)
-            .reset_index(drop=True)
-        )
+    out["flagged"] = flags
+    out["flag_threshold"] = thr_out.astype(np.float32)
+    out["slice_rank"] = rank_in_slice.astype(np.int32)
 
     summary = (
-        flagged_df.groupby(group_keys)
-        .agg(total_samples=("S", "size"), flagged_samples=("flagged", "sum"))
+        out.groupby(group_keys, dropna=False)
+        .agg(total_samples=(flag_col, "size"), flagged_samples=("flagged", "sum"))
         .reset_index()
     )
     summary["flagged_fraction"] = summary["flagged_samples"] / summary["total_samples"]
-    return flagged_df, summary
+    return out, summary
 
 
 # ---------------------------------------------------------------------------
@@ -1556,16 +1897,43 @@ def flag_anomalies(
 # ---------------------------------------------------------------------------
 
 
+#: Flag values that mean "the pipeline reached a final decision about this row"
+#: even though some numeric columns are legitimately null.  Without this, rows
+#: whose ``ewoc_code`` is absent from the legend (NaN label) or whose slice was
+#: too small to score were re-detected as "unscored" on *every* incremental
+#: update, so the impact zone grew each run and the update mode never
+#: converged.  ``normal`` etc. are included so the check is a simple non-null
+#: test on the flag column.
+TERMINAL_FLAG_VALUES: set = {
+    "normal",
+    "flagged",
+    "suspect",
+    "candidate",
+    "unscored",
+    "unscorable",
+    "unmapped",
+    "skipped",
+}
+
+
 def find_unscored_samples(
     long_parquet_dir: Union[str, Path],
     anomaly_cols: Optional[List[str]] = None,
     parquet_glob: str = "**/*.parquet",
     read_cols: Optional[List[str]] = None,
+    flag_col: Optional[str] = None,
 ) -> pd.DataFrame:
     """Scan partitioned long-format parquets and return rows with missing anomaly scores.
 
-    A row is "unscored" if **any** of the *anomaly_cols* is NaN/missing, OR if
-    the anomaly columns do not exist in the file at all (newly added dataset).
+    A row is "unscored" if the anomaly columns do not exist in the file at all
+    (newly added dataset), or if the pipeline never reached a decision for it.
+
+    "Reached a decision" is determined from *flag_col* when available: a row
+    carrying any of :data:`TERMINAL_FLAG_VALUES` is considered handled, even if
+    other anomaly columns are null.  Falling back to "any column is NaN" (the
+    previous rule) made unmappable and too-small-to-score rows permanently
+    unscored, so each ``--mode update`` run rediscovered them and re-expanded
+    the impact zone without ever making progress.
 
     Only the lightweight identifier columns are returned — never band data.
 
@@ -1596,6 +1964,9 @@ def find_unscored_samples(
         anomaly_cols = list(ANOMALY_COLUMNS)
 
     id_cols = ["ref_id", "sample_id"]
+    if flag_col is None:
+        flag_candidates = [c for c in anomaly_cols if c.endswith("_anomaly_flag")]
+        flag_col = flag_candidates[0] if flag_candidates else None
     want_cols = list(dict.fromkeys(id_cols + (read_cols or []) + anomaly_cols))
 
     parquet_files = sorted(long_parquet_dir.glob(parquet_glob))
@@ -1621,8 +1992,13 @@ def find_unscored_samples(
         if not has_anomaly_cols:
             # All rows are unscored
             unscored = df
+        elif flag_col is not None and flag_col in df.columns:
+            # Decision-based: a terminal flag value means "handled", whatever
+            # the other columns contain.
+            decided = df[flag_col].astype("object").isin(TERMINAL_FLAG_VALUES)
+            unscored = df[~decided]
         else:
-            # Rows where ANY anomaly column is NaN
+            # Rows where ANY anomaly column is NaN (legacy fallback)
             mask = df[anomaly_cols].isna().any(axis=1)
             unscored = df[mask]
 
@@ -1741,21 +2117,37 @@ def load_affected_embeddings_from_cache(
         cols_df = con.execute("PRAGMA table_info('embeddings_cache')").fetchdf()
         embed_cols = [c for c in cols_df.name.tolist() if c.startswith("embedding_")]
 
+        available = set(cols_df.name.tolist())
         base_cols = [
             "sample_id", "ewoc_code", "model_hash", "ref_id",
             "h3_l3_cell", "lat", "lon",
         ]
-        select_cols = list(dict.fromkeys([*base_cols, *group_cols]))
+        # Select only columns the cache actually has, so a group_col or time_col
+        # that was never cached surfaces as a message instead of a SQL error on
+        # a nonexistent column.
+        _wanted = list(dict.fromkeys([*base_cols, *group_cols]))
+        _missing = [c for c in _wanted if c not in available]
+        if _missing:
+            print(
+                f"[anomaly] NOTE: {_missing} not present in embeddings_cache; "
+                "not loaded."
+            )
+        select_cols = [c for c in _wanted if c in available]
 
         # ------------------------------------------------------------------
         # Phase 1: Lightweight query — fetch only h3_l3_cell to determine
         # which L3 cells are in the impact zone.  This avoids loading the
         # full embeddings table (~7M rows × 128 floats) into memory.
         # ------------------------------------------------------------------
-        where_clause = f" WHERE model_hash='{restrict_model_hash}'" if restrict_model_hash else ""
-        l3_cells_df = con.execute(
-            f"SELECT DISTINCT h3_l3_cell FROM embeddings_cache{where_clause}"
-        ).fetchdf()
+        if restrict_model_hash:
+            l3_cells_df = con.execute(
+                "SELECT DISTINCT h3_l3_cell FROM embeddings_cache WHERE model_hash = ?",
+                [restrict_model_hash],
+            ).fetchdf()
+        else:
+            l3_cells_df = con.execute(
+                "SELECT DISTINCT h3_l3_cell FROM embeddings_cache"
+            ).fetchdf()
 
         if l3_cells_df.empty:
             return pd.DataFrame(), embed_cols
@@ -1797,9 +2189,10 @@ def load_affected_embeddings_from_cache(
             f"INNER JOIN impact_l3_cells f ON e.h3_l3_cell = f.h3_l3_cell"
         )
         if restrict_model_hash:
-            query += f" AND e.model_hash='{restrict_model_hash}'"
-
-        df = con.execute(query).fetchdf()
+            query += " AND e.model_hash = ?"
+            df = con.execute(query, [restrict_model_hash]).fetchdf()
+        else:
+            df = con.execute(query).fetchdf()
     finally:
         con.close()
 
@@ -1898,7 +2291,19 @@ def merge_scores_to_long_parquets(
     # Build a lookup: only the columns we need from scored_df
     merge_cols = ["ref_id", "sample_id"] + anomaly_cols
     available_merge = [c for c in merge_cols if c in scored_df.columns]
-    scores_lookup = scored_df[available_merge].drop_duplicates(subset="sample_id")
+    # De-duplicate on the FULL join key.  Collapsing on sample_id alone while
+    # joining on (ref_id, sample_id) silently dropped the scores of every row
+    # whose sample_id repeated under a different ref_id — those rows then came
+    # back as NaN and were rediscovered as "unscored" forever.
+    dedup_subset = [c for c in ("ref_id", "sample_id") if c in scored_df.columns]
+    scores_lookup = scored_df[available_merge].drop_duplicates(subset=dedup_subset)
+    if "sample_id" in scores_lookup.columns:
+        n_dup_ids = int(scores_lookup["sample_id"].duplicated().sum())
+        if n_dup_ids:
+            print(
+                f"[anomaly] NOTE: {n_dup_ids:,} sample_id values occur under more "
+                "than one ref_id; joining on the composite key."
+            )
 
     parquet_files = sorted(long_parquet_dir.glob(parquet_glob))
     n_written = 0

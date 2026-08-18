@@ -60,6 +60,8 @@ EBA_detector/
 │   ├── anomaly_utils.py        # Stateless helpers: scoring, metrics, normalization,
 │   │                           # flagging, adaptive H3, incremental utilities
 │   ├── anomaly.py              # Pipeline orchestration: load -> map -> score -> flag -> write
+│   ├── calibration.py          # Cross-slice null; absolute z-scores (the absolute gate)
+│   ├── quality.py              # Embedding / encoder / H3 validation before scoring
 │   ├── robust_extensions.py    # Trimmed centroid, slice-trust gate, group aggregation
 │   ├── embeddings_cache.py     # DuckDB-backed embedding cache (Presto, 128-d)
 │   ├── validation.py           # Synthetic label-noise injection & recovery metrics
@@ -144,10 +146,14 @@ flagged_gdf, summary_df = run_pipeline(
     h3_level=[2, 3],           # adaptive: try L2 first, fall back to L3
     group_cols=["ref_id"],
     min_slice_size=100,
-    threshold_mode="mad",
-    mad_k=4.0,
-    centroid_mode="trimmed", centroid_trim=0.05,
-    max_flagged_fraction=0.10,
+    # Locality with a dispersion the slice cannot inflate
+    threshold_mode="stable_mad", mad_k=3.0,
+    # Cross-slice absolute gate (see "How a sample gets flagged")
+    require_absolute=True, abs_z_k=3.0,
+    # Should be >= the largest contamination you expect in a slice
+    centroid_mode="trimmed", centroid_trim=0.20,
+    # Compare like with like in time — embeddings are season-specific
+    time_col="year",
     gate_confidence_by_flag=True,
     output_samples_path="/path/to/outlier_scores.parquet",
     output_summary_path="/path/to/outlier_summary.parquet",
@@ -164,6 +170,8 @@ python scripts/compute_anomaly_scores.py \
     --output-long-dir /path/to/reference_parquets_with_anomaly \
     --embeddings-db-path /path/to/embeddings_cache.duckdb \
     --wide-dir /path/to/cached_wide_parquets \
+    --group-cols ref_id --time-col year \
+    --abs-z-k 3.0 --strict-quality \
     --lc10-h3-levels 2 3 --lc10-min-slice-size 100 --lc10-mad-k 3.0 \
     --cty24-h3-levels 2 3 --cty24-min-slice-size 100 --cty24-mad-k 3.0
 
@@ -184,11 +192,107 @@ domain (LANDCOVER10 / CROPTYPE24):
 | Column | Description |
 |---|---|
 | `LC10_confidence_nonoutlier` | Confidence that the sample is **not** an outlier under LC10 — float32 in `[0, 1]` |
-| `LC10_anomaly_flag` | Category under LC10: `normal / flagged / suspect / candidate` |
+| `LC10_anomaly_flag` | Category under LC10 (see below) |
 | `outlier_LC10_cls` | Label class used for LC10 scoring |
 | `CTY24_confidence_nonoutlier` | As above, under the CROPTYPE24 mapping |
 | `CTY24_anomaly_flag` | Category under CTY24 |
 | `outlier_CTY24_cls` | Label class used for CTY24 scoring |
+
+### Flag values
+
+| Value | Meaning |
+|---|---|
+| `normal` | Examined, no evidence of a problem |
+| `flagged` | Unusual relative to its slice **and** in absolute terms |
+| `suspect` | Corroborated by ≥2 independent signals |
+| `candidate` | Strongly corroborated — the removal-worthy tier |
+| `unscored` | Slice too small to score. **Not** the same as `normal` |
+| `unscorable` | Embedding failed the quality gate (zero-norm, non-finite, duplicate id) |
+| `unmapped` | `ewoc_code` absent from the legend — a coverage gap, not a data quirk |
+| `skipped` | held out by `skip_classes` |
+
+The last four are terminal states: they record that the detector *could not
+form an opinion*. Treating them as `normal` (the previous behaviour) hides the
+blind spot from downstream training and makes the incremental `--mode update`
+pathway rediscover the same rows forever.
+
+Alongside these, the review parquets keep the **evidence** behind each call —
+`abs_z`, `cosine_distance`, `knn_distance`, `neighbourhood_offset`,
+`knn_same_label_frac_ctx`, `alt_margin_ctx`, `escalation_votes`,
+`weak_support`, `purity_veto`, `corroborated`, `quality_reason` — so a flag can
+be audited against a basemap instead of taken on trust.
+
+---
+
+## How a sample gets flagged
+
+Two conditions must both hold. This is the core of the method and the part
+that changed most recently.
+
+1. **Locally unusual.** Its distance exceeds the slice's own median by
+   `mad_k` times a dispersion borrowed from the cross-slice null
+   (`threshold_mode="stable_mad"`).
+2. **Absolutely unusual.** Its `abs_z` exceeds `abs_z_k` robust sigma against
+   a null pooled across many slices of the same class.
+
+Why both are needed: every within-slice score is percentile-normalised per
+slice, so on its own it cannot distinguish *the most unusual point of a clean
+slice* from *a mislabelled point* — the top ~2 % of every slice clears a rank
+quantile whether or not the slice contains a single error. And a within-slice
+`median + k·MAD` gate is not a fix, because a contaminated slice inflates its
+own median and MAD: measured on synthetic data the legacy rule flagged **0 %**
+at both 2 % and 30 % true contamination, but 9 % at 10 %.
+
+The null is built from **one summary statistic per slice**, so a contaminated
+slice contributes a single observation and cannot calibrate its own errors
+away.
+
+Escalation to `suspect` / `candidate` requires agreement across signals that
+measure genuinely different things — absolute distance, kNN **label purity**,
+the **alt-class margin**, and within-slice rank. (The previous 2-of-3 vote over
+`S_rank`, `S_rank_min` and `S_z` was not a consensus: the first two are the
+mean and the min of the same two rank vectors.) Two safeguards apply on top:
+
+- **Purity veto** — a point whose neighbours overwhelmingly share its label is
+  capped at `flagged`. Being an unusual *example* of a class is not evidence of
+  a wrong label when the neighbourhood agrees.
+- **No corroboration, no strong claim** — where the context contains a single
+  label there is no alternative class to have been confused with, so escalation
+  is capped at `flagged`.
+
+Set `require_absolute=False` (CLI: `--no-absolute-gate`) to reproduce the
+legacy relative-only behaviour for ablations.
+
+### Slice vs context
+
+`group_cols` (default `["ref_id"]`) defines the **slice**: the reference cloud a
+sample is scored against. Keeping it per-dataset stops one dataset's labelling
+convention contaminating another's. Pass `group_cols=[]` to pool across datasets.
+
+`context_group_cols` (default `[]`) defines the **context**: the neighbourhood
+the kNN-purity and alt-class-margin signals are measured over. It deliberately
+does *not* inherit `group_cols` — "what else is on the ground around this point?"
+is a geographic question, and restricting it to the same `ref_id` makes those
+signals collapse for single-crop datasets (every point trivially has purity 1.0
+and there is no alternative class centroid to measure a margin against).
+
+### Degenerate populations
+
+If a class's pooled scale collapses — near-duplicate embeddings, e.g. grid-sampled
+polygon interiors — the null scale is rejected rather than floored, and nothing in
+that class is flagged. Flooring it would turn the absolute gate into a hair
+trigger: a normal distance divided by a floored pseudo-scale yields z-scores in
+the thousands, and measured on a duplicate-heavy synthetic that flagged 46 % of
+the *ordinary* slices with zero planted errors.
+
+### Known limit
+
+Calibration removes the artificial blind spot; it does not remove the
+**identifiability** limit. Once mislabelled points approach half of their own
+class within a region, no purely geometric method can say which half is wrong.
+That regime is what the per-`ref_id` rollup (written next to the summary as
+`*_by_ref_id.parquet`) and the `time_col` split are for: the evidence lives at
+the level of the dataset, not the point.
 
 ---
 

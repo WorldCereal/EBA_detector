@@ -36,8 +36,6 @@ import h3
 import numpy as np
 import pandas as pd
 
-from worldcereal.utils.refdata import get_class_mappings, map_classes
-
 # All computation helpers live in anomaly_utils — import them here so that
 # any downstream code doing ``from EBA_detector.anomaly import <func>``
 # continues to work.
@@ -75,23 +73,67 @@ from EBA_detector.robust_extensions import (
     downgrade_flags_low_trust,
 )
 
+# Absolute-scale calibration: turns within-slice relative scores into
+# cross-slice comparable evidence.  See calibration.py for why this is the
+# central fix for both the clean-slice false positives and the
+# heavily-contaminated-slice false negatives.
+from EBA_detector.calibration import (
+    add_absolute_scores,
+    compute_null_reference,
+    suggest_abs_z_threshold,
+)
+from EBA_detector.quality import (
+    assert_h3_matches_coordinates,
+    assert_single_model_hash,
+    validate_embeddings,
+)
+
 
 # ===================================================================
 # Pipeline
 # ===================================================================
 
 
+def _worldcereal_map_classes(df: pd.DataFrame, class_mappings_name: str) -> pd.DataFrame:
+    """Lazy proxy for ``worldcereal.utils.refdata.map_classes``.
+
+    Imported on demand rather than at module scope: ``map_classes`` is only
+    reached when ``map_to_finetune=True``, but a module-level import made the
+    whole orchestration layer — including the scoring, flagging and calibration
+    it coordinates — impossible to import (and therefore to unit-test) without a
+    full worldcereal install.  The README advertises tests that need "no DuckDB,
+    no network"; this is what makes that true of ``anomaly.py`` as well.
+    """
+    from worldcereal.utils.refdata import map_classes
+
+    return map_classes(df, class_mappings_name)
+
+
+def get_class_mappings(*args, **kwargs):
+    """Lazy re-export of ``worldcereal.utils.refdata.get_class_mappings``."""
+    from worldcereal.utils.refdata import get_class_mappings as _impl
+
+    return _impl(*args, **kwargs)
+
+
+
 def _load_embeddings(
     con: duckdb.DuckDBPyConnection,
     group_cols: list[str],
     restrict_model_hash: Optional[str],
+    extra_cols: Optional[Sequence[str]] = None,
 ) -> Tuple[pd.DataFrame, list[str]]:
     """Load cached embeddings from DuckDB.
 
     Returns ``(df, embed_cols)`` where *embed_cols* are the raw
     ``embedding_0 … embedding_N`` column names.
+
+    *extra_cols* (e.g. a temporal column) are selected **only if the cache
+    actually has them**; a missing one is reported rather than turned into a
+    SQL error on a nonexistent column.
     """
     cols_df = con.execute("PRAGMA table_info('embeddings_cache')").fetchdf()
+    available = set(cols_df.name.tolist())
     embed_cols = [c for c in cols_df.name.tolist() if c.startswith("embedding_")]
 
     base_cols = [
@@ -104,13 +146,24 @@ def _load_embeddings(
         "lon",
         # "country",
     ]
-    select_cols = list(dict.fromkeys([*base_cols, *group_cols]))  # preserve order, unique
+    wanted = [*base_cols, *group_cols, *(list(extra_cols) if extra_cols else [])]
+    missing = [c for c in dict.fromkeys(wanted) if c not in available]
+    if missing:
+        print(
+            f"[anomaly] NOTE: requested column(s) {missing} are not in the "
+            "embeddings cache and will not be loaded. If one of these is your "
+            "time_col or a group_col, rebuild the cache with that column — "
+            "otherwise the corresponding control is silently inactive."
+        )
+    select_cols = [c for c in dict.fromkeys(wanted) if c in available]
 
+    # Parameterised rather than interpolated: model_hash is external input.
     query = f"SELECT {', '.join(select_cols + embed_cols)} FROM embeddings_cache"
     if restrict_model_hash:
-        query += f" WHERE model_hash='{restrict_model_hash}'"
-
-    df = con.execute(query).fetchdf()
+        query += " WHERE model_hash = ?"
+        df = con.execute(query, [restrict_model_hash]).fetchdf()
+    else:
+        df = con.execute(query).fetchdf()
     return df, embed_cols
 
 
@@ -173,7 +226,7 @@ def _apply_class_mapping(
 
     if map_to_finetune:
         print(f"[anomaly] Mapping classes using '{class_mappings_name}'...")
-        return map_classes(df, class_mappings_name)
+        return _worldcereal_map_classes(df, class_mappings_name)
 
     if mapping_file is None:
         return df
@@ -220,82 +273,219 @@ def _apply_class_mapping(
 
 def _assign_anomaly_categories(
     flagged_df: pd.DataFrame,
+    *,
+    abs_z_suspect: float = 4.0,
+    abs_z_candidate: float = 5.5,
+    purity_suspect_max: float = 0.60,
+    purity_candidate_max: float = 0.35,
+    purity_veto: float = 0.80,
+    margin_suspect_max: float = 0.0,
+    rank_suspect_min: float = 0.98,
+    rank_candidate_min: float = 0.995,
+    suspect_votes: int = 2,
+    candidate_votes: int = 3,
 ) -> pd.DataFrame:
     """Assign ``S_anomaly`` and ``combined_anomaly`` escalation categories.
 
-    Operates in-place on *flagged_df* and returns it.
+    What changed and why
+    --------------------
+    The previous ``combined_anomaly`` claimed a 2-of-3 / 3-of-3 "consensus"
+    over ``S_rank``, ``S_rank_min`` and ``S_z``.  Those are not three
+    independent views: ``S_rank`` is the *mean* and ``S_rank_min`` the *min* of
+    the same two rank vectors, so the pair moves together and can outvote the
+    only signal carrying an absolute scale.  Because rank percentiles are
+    uniform by construction, "2 of 3 above 0.98" reduced to "the top ~2 % of
+    this slice" — a fixed quota that fires in clean slices just as reliably as
+    in dirty ones.
+
+    The vote is now built from **genuinely different measurements**:
+
+    ``absolute``
+        ``abs_z`` — distance in robust sigma against the cross-slice null
+        (:mod:`EBA_detector.calibration`).  The only vote that knows whether
+        this slice is unusual *compared to other slices*.
+    ``purity``
+        ``knn_same_label_frac_ctx`` — what fraction of the point's nearest
+        neighbours in its geographic context carry the same label.  Independent
+        of any centroid.
+    ``margin``
+        ``alt_margin_ctx`` — distance to the nearest *other* class centroid
+        minus distance to its own.  Negative means the embedding prefers a
+        different label, which is the closest thing to direct evidence of
+        mislabelling that this method produces.
+    ``rank``
+        The within-slice rank, retained as one vote among several rather than
+        as the whole decision.
+
+    Purity veto
+    -----------
+    A point whose neighbours overwhelmingly share its label (``>= purity_veto``)
+    is capped at ``flagged`` and can never reach ``suspect`` / ``candidate``,
+    however far it sits from the centroid.  Being an unusual *example* of a
+    class — a late-planted field, an odd cultivar, a different soil — is not
+    evidence of a wrong label when the neighbourhood agrees. This single rule
+    removes a large share of the basemap false positives.
+
+    Support caps
+    ------------
+    Rows scored against a borrowed reference (``ref_outlier_level > 0``, the
+    coarse-label fallback) or sitting in an undersized slice are capped one
+    level down: the evidence is real but weaker, and it should not drive
+    deletion from a training set.
     """
-    # flagged_df["S_rank_min"] = np.minimum(flagged_df["cos_rank"], flagged_df["knn_rank"])
+    n = len(flagged_df)
     is_flagged = flagged_df["flagged"].fillna(False).to_numpy(dtype=bool)
 
-    # --- S_anomaly: based on S and rank_percentile ---
+    def _num(col: str, default: float) -> np.ndarray:
+        if col not in flagged_df.columns:
+            return np.full(n, default, dtype="float64")
+        return (
+            pd.to_numeric(flagged_df[col], errors="coerce")
+            .fillna(default)
+            .to_numpy(dtype="float64")
+        )
+
+    # --- S_anomaly: legacy rank-only view, retained for comparison ----------
+    # Kept so ablations can quantify exactly how much the absolute gate and the
+    # purity veto changed the outcome; it is NOT the shipped decision.
     S_anomaly = "S_anomaly"
     flagged_df[S_anomaly] = "normal"
     flagged_df.loc[is_flagged, S_anomaly] = "flagged"
+    rank_pct = _num("rank_percentile", 0.0)
+    s_val = _num("S", 0.0)
     flagged_df.loc[
-        (flagged_df["rank_percentile"] >= 0.98)
-        & (flagged_df["S"] >= 0.95)
-        & is_flagged,
-        S_anomaly,
+        (rank_pct >= 0.98) & (s_val >= 0.95) & is_flagged, S_anomaly
     ] = "suspect"
     flagged_df.loc[
-        (flagged_df["rank_percentile"] >= 0.99)
-        & (flagged_df["S"] >= 0.99)
-        & is_flagged,
-        S_anomaly,
+        (rank_pct >= 0.99) & (s_val >= 0.99) & is_flagged, S_anomaly
     ] = "candidate"
 
-    # --- combined_anomaly: consensus of S_rank, S_rank_min, S_z ---
-    combined_anomaly = "combined_anomaly"
-    flagged_df[combined_anomaly] = "normal"
-    flagged_df.loc[is_flagged, combined_anomaly] = "flagged"
+    # --- combined_anomaly: independent-signal consensus ---------------------
+    combined = "combined_anomaly"
+    flagged_df[combined] = "normal"
+    flagged_df.loc[is_flagged, combined] = "flagged"
 
-    # Consensus-based escalation using multiple score variants (more robust than S alone)
-    # All three are in [0,1] where higher => more anomalous
-    suspect_thr = 0.98
-    candidate_thr = 0.99
+    abs_z = _num("abs_z", -np.inf)
+    purity = _num("knn_same_label_frac_ctx", np.nan)
+    margin = _num("alt_margin_ctx", np.nan)
+    s_rank = _num("S_rank", 0.0)
 
-    suspect_k_of_m = 2   # require 2-of-3 signals for "suspect"
-    candidate_k_of_m = 3  # require 3-of-3 signals for "candidate" (strict)
+    # A missing auxiliary signal must not count as evidence of anomaly.
+    purity_known = np.isfinite(purity)
+    margin_known = np.isfinite(margin)
 
-    score_votes_suspect = (
-        (flagged_df["S_rank"] >= suspect_thr).astype(int)
-        + (flagged_df["S_rank_min"] >= suspect_thr).astype(int)
-        + (flagged_df["S_z"] >= suspect_thr).astype(int)
+    votes_suspect = (
+        (abs_z >= abs_z_suspect).astype(int)
+        + (purity_known & (purity <= purity_suspect_max)).astype(int)
+        + (margin_known & (margin <= margin_suspect_max)).astype(int)
+        + (s_rank >= rank_suspect_min).astype(int)
     )
-    score_votes_candidate = (
-        (flagged_df["S_rank"] >= candidate_thr).astype(int)
-        + (flagged_df["S_rank_min"] >= candidate_thr).astype(int)
-        + (flagged_df["S_z"] >= candidate_thr).astype(int)
+    votes_candidate = (
+        (abs_z >= abs_z_candidate).astype(int)
+        + (purity_known & (purity <= purity_candidate_max)).astype(int)
+        + (margin_known & (margin <= margin_suspect_max)).astype(int)
+        + (s_rank >= rank_candidate_min).astype(int)
     )
 
-    # Escalate categories only for already-flagged samples
+    # The absolute vote is mandatory for escalation: without a cross-slice
+    # scale there is no way to tell "worst in a clean slice" from "wrong".
+    abs_ok_suspect = abs_z >= abs_z_suspect
+    abs_ok_candidate = abs_z >= abs_z_candidate
+
     flagged_df.loc[
-        is_flagged & (score_votes_suspect >= suspect_k_of_m),
-        combined_anomaly,
+        is_flagged & abs_ok_suspect & (votes_suspect >= suspect_votes), combined
     ] = "suspect"
-
     flagged_df.loc[
-        is_flagged & (score_votes_candidate >= candidate_k_of_m),
-        combined_anomaly,
+        is_flagged & abs_ok_candidate & (votes_candidate >= candidate_votes), combined
     ] = "candidate"
 
-    # Optional: downgrade confidence for undersized slices (if column exists)
+    flagged_df["escalation_votes"] = votes_suspect.astype(np.int8)
+
+    # --- purity veto --------------------------------------------------------
+    # Only applied where purity is *informative*.  In a context containing a
+    # single label every point trivially has purity 1.0, which would veto every
+    # escalation in the region — turning the safeguard into a blanket mute.
+    # The veto means "the neighbours disagree with the flag", which requires at
+    # least one alternative label to be present to disagree with.
+    if "knn_same_label_frac_ctx" in flagged_df.columns:
+        if "context_n_labels" in flagged_df.columns:
+            informative = (
+                pd.to_numeric(flagged_df["context_n_labels"], errors="coerce")
+                .fillna(0)
+                .to_numpy()
+                >= 2
+            )
+        else:
+            informative = np.ones(n, dtype=bool)
+        vetoed = purity_known & informative & (purity >= purity_veto)
+        flagged_df.loc[
+            vetoed & flagged_df[combined].isin(["suspect", "candidate"]), combined
+        ] = "flagged"
+        flagged_df["purity_veto"] = vetoed
+
+        # No corroboration available -> no strong claim.
+        #
+        # `suspect` / `candidate` assert that a sample is probably *mislabelled*.
+        # That claim needs an alternative label for it to have been confused
+        # with.  Where the context holds a single label, the purity and margin
+        # votes are unavailable and the consensus silently degenerates back to
+        # the two correlated within-slice signals — reintroducing the fixed
+        # per-slice quota this rewrite exists to remove.  Cap such rows at
+        # `flagged`: still surfaced for review, but not asserted as a label
+        # error on evidence that cannot distinguish "unusual" from "wrong".
+        no_corroboration = ~informative
+        flagged_df.loc[
+            no_corroboration & flagged_df[combined].isin(["suspect", "candidate"]),
+            combined,
+        ] = "flagged"
+        flagged_df["corroborated"] = informative
+
+    # --- weak-support caps --------------------------------------------------
+    weak = np.zeros(n, dtype=bool)
     if "undersized_slice" in flagged_df.columns:
-        low_conf = flagged_df["undersized_slice"] == True  # noqa: E712
-        # candidate -> suspect; suspect -> flagged (only when undersized)
-        flagged_df.loc[
-            low_conf & (flagged_df[S_anomaly] == "candidate"), S_anomaly
-        ] = "suspect"
-        flagged_df.loc[
-            low_conf & (flagged_df[S_anomaly] == "suspect"), S_anomaly
-        ] = "flagged"
-        flagged_df.loc[
-            low_conf & (flagged_df[combined_anomaly] == "candidate"), combined_anomaly
-        ] = "suspect"
-        flagged_df.loc[
-            low_conf & (flagged_df[combined_anomaly] == "suspect"), combined_anomaly
-        ] = "flagged"
+        weak |= flagged_df["undersized_slice"].fillna(False).to_numpy(dtype=bool)
+    if "ref_outlier_level" in flagged_df.columns:
+        weak |= (
+            pd.to_numeric(flagged_df["ref_outlier_level"], errors="coerce")
+            .fillna(0)
+            .to_numpy()
+            > 0
+        )
+    if "merge_steps" in flagged_df.columns:
+        weak |= (
+            pd.to_numeric(flagged_df["merge_steps"], errors="coerce")
+            .fillna(0)
+            .to_numpy()
+            >= 2
+        )
+
+    if weak.any():
+        # Compute the demotion from a SNAPSHOT.  Chaining two .loc assignments
+        # re-reads the column after the first one, so a `candidate` became
+        # `suspect` and was then immediately demoted again to `flagged` — a
+        # two-level drop, not the one level documented.  That mattered much more
+        # after `weak` widened from `undersized_slice` alone to also cover every
+        # hierarchical-fallback row and every twice-merged slice, which between
+        # them made `candidate` effectively unreachable for a large share of the
+        # population.
+        _demote = {"candidate": "suspect", "suspect": "flagged"}
+        for col in (S_anomaly, combined):
+            snapshot = flagged_df[col].to_numpy(copy=True)
+            demoted = np.array(
+                [_demote.get(v, v) if w else v for v, w in zip(snapshot, weak)],
+                dtype=object,
+            )
+            flagged_df[col] = demoted
+    flagged_df["weak_support"] = weak
+
+    # --- terminal states for rows the detector could not judge --------------
+    # These used to be reported as "normal", i.e. indistinguishable from "we
+    # looked and it is fine".  They are now explicit so downstream training can
+    # decide what to do with them, and so the incremental update pathway stops
+    # rediscovering them as unscored on every run.
+    if "scored" in flagged_df.columns:
+        unscored = ~flagged_df["scored"].fillna(False).to_numpy(dtype=bool)
+        flagged_df.loc[unscored, [S_anomaly, combined]] = "unscored"
 
     return flagged_df
 
@@ -354,7 +544,7 @@ def _write_outputs(
         flagged_gdf = flagged_gdf.drop(columns=["base_embedding"], errors="ignore")
         flagged_gdf.to_parquet(output_samples_path, index=False)
 
-    if output_summary_path:
+    if output_summary_path and summary_df is not None:
         print(f"[anomaly] Writing summary -> {output_summary_path}")
         summary_df.to_parquet(output_summary_path, index=False)
         summary_df.to_excel(
@@ -427,9 +617,9 @@ def run_pipeline(
     max_slice_size: Optional[int] = None,
     merge_small_slice: bool = True,
     max_merge_iterations=10,
-    threshold_mode: str = "mad",
+    threshold_mode: str = "stable_mad",
     percentile_q: float = 0.96,
-    mad_k: float = 4.0,
+    mad_k: float = 3.0,
     abs_threshold: Optional[float] = None,
     fdr_alpha: float = 0.05,
     min_flagged_per_slice: Optional[int] = None,
@@ -437,10 +627,28 @@ def run_pipeline(
     max_full_pairwise_n: Optional[int] = 0,
     norm_percentiles: Tuple[float, float] = (2.0, 98.0),
     centroid_mode: str = "trimmed",
-    centroid_trim: float = 0.05,
+    centroid_trim: float = 0.20,
     gate_confidence_by_flag: bool = True,
     apply_slice_trust: bool = False,
     slice_trust_min: float = 0.05,
+    # --- absolute-scale calibration -------------------------------------
+    require_absolute: bool = True,
+    abs_z_k: float = 3.0,
+    abs_z_suspect: float = 4.0,
+    abs_z_candidate: float = 5.5,
+    null_extra_keys: Optional[Sequence[str]] = None,
+    abs_combine: str = "min",
+    # --- support / quality ----------------------------------------------
+    min_scoring_slice_size: int = MIN_SCORING_SLICE_SIZE,
+    quality_gate: bool = True,
+    strict_quality: bool = False,
+    # --- temporal control -------------------------------------------------
+    time_col: Optional[str] = None,
+    # --- context for auxiliary signals ------------------------------------
+    context_group_cols: Optional[Sequence[str]] = None,
+    # --- auxiliary-signal fusion -----------------------------------------
+    apply_confidence_fusion_to_output: bool = True,
+    purity_veto: float = 0.80,
     output_samples_path: Optional[str] = None,
     output_summary_path: Optional[str] = None,
     skip_existing_samples: bool = False,
@@ -520,8 +728,55 @@ def run_pipeline(
         consistent with the discrete ``anomaly_flag`` and avoiding a spurious
         penalty on the highest-ranked point of clean slices.  Set *False* for
         the legacy ungated behaviour.
+    require_absolute, abs_z_k, abs_z_suspect, abs_z_candidate
+        Enable and tune the **absolute** gate.  Every within-slice score in
+        this pipeline is percentile-normalised per slice, so on its own it
+        cannot tell "the most unusual point of a clean slice" from "a
+        mislabelled point": the top ~2 % of every slice reaches the escalation
+        thresholds by construction.  With *require_absolute* a point must also
+        exceed *abs_z_k* robust sigma against a null pooled across many slices
+        of the same class, built from one summary statistic per slice so a
+        contaminated slice cannot calibrate its own errors away.  Set
+        ``require_absolute=False`` to reproduce the legacy relative-only
+        behaviour for ablations.
+    null_extra_keys
+        Extra columns to condition the null on, beyond the label class — e.g.
+        a continent or year column when distance scales differ systematically
+        between them.
+    abs_combine
+        How the per-metric absolute z-scores are combined: ``"min"`` (default,
+        conservative — a point must look anomalous on *both* the centroid
+        distance and the kNN distance), ``"max"`` (higher recall), or
+        ``"mean"``.
+    min_scoring_slice_size
+        Slices below this are not scored.  Their rows now receive the explicit
+        ``unscored`` flag state instead of ``normal``, so "we did not look" is
+        distinguishable from "we looked and it is fine".  Previously this was a
+        hard-coded module constant of 50 that silently disagreed with
+        *min_slice_size*.
+    quality_gate, strict_quality
+        Validate the embeddings before scoring and quarantine degenerate ones
+        as ``unscorable``.  A zero-norm embedding gets ``cosine_distance = 1.0``
+        — the maximum possible — so failed inference or an all-cloud time
+        series was previously *guaranteed* to be flagged.  *strict_quality*
+        additionally hard-errors on mixed ``model_hash`` and on H3 cells that
+        disagree with the coordinates.
+    time_col
+        Optional temporal key (year / season).  Reference data spans many
+        years and the embeddings are season-specific, so a 2018 sample in a
+        cell dominated by 2021 samples is distant for phenological rather than
+        label reasons.  When given, this column joins the slice and context
+        keys so points are only ever compared within the same period, and a
+        ``time_minority_frac`` diagnostic is emitted.
+    apply_confidence_fusion_to_output, purity_veto
+        Fold the kNN label-purity and alt-class-margin signals into the shipped
+        ``confidence_nonoutlier`` (previously they were computed at real cost,
+        written to ``confidence_alt``, and then discarded), and cap escalation
+        for points whose neighbourhood agrees with their label.
     """
     group_cols = list(group_cols or [])
+    # Auxiliary-signal context: geographic by default (see section 7).
+    context_group_cols = list(context_group_cols or [])
     label_cols = _as_label_levels(label_domain)
     label_col = label_cols[0]  # keep existing logic anchored to level-0
 
@@ -553,7 +808,10 @@ def run_pipeline(
     else:
         print("[anomaly] Connecting DuckDB and loading cached embeddings...")
         con = duckdb.connect(embeddings_db_path)
-        df, embed_cols = _load_embeddings(con, group_cols, restrict_model_hash)
+        df, embed_cols = _load_embeddings(
+            con, group_cols, restrict_model_hash,
+            extra_cols=[time_col] if time_col else None,
+        )
 
     print(f"[anomaly] Loaded {len(df):,} rows from embeddings_cache")
     if df.empty:
@@ -562,6 +820,27 @@ def run_pipeline(
         raise ValueError(
             "No rows loaded from embeddings_cache. Check model_hash or DB path."
         )
+
+    # ------------------------------------------------------------------
+    # 1b. Input sanity: encoder consistency and H3/coordinate agreement
+    # ------------------------------------------------------------------
+    # Distances between vectors from two different encoders are meaningless,
+    # and the whole spatial-slicing premise rests on h3_l3_cell being right.
+    # Both were previously assumed rather than checked.
+    if quality_gate:
+        assert_single_model_hash(
+            df, restrict_model_hash=restrict_model_hash, strict=strict_quality
+        )
+        try:
+            mismatch = assert_h3_matches_coordinates(df, strict=strict_quality)
+            if mismatch:
+                print(
+                    f"[anomaly] H3/coordinate mismatch on {mismatch:.2%} of sampled rows"
+                )
+        except ValueError:
+            if con is not None:
+                con.close()
+            raise
 
     # ------------------------------------------------------------------
     # 2. Incremental mode — skip already-processed sample_ids
@@ -663,19 +942,80 @@ def run_pipeline(
 
     _require_label_columns(df, label_cols)
 
-    # For hierarchical mode, enforce all levels present (required for fallback)
+    # ------------------------------------------------------------------
+    # 5a. Embedding quality gate
+    # ------------------------------------------------------------------
+    # Degenerate vectors are not "very anomalous samples", they are missing
+    # data.  _cosine_similarity returns 0.0 for a zero-norm vector, which makes
+    # cosine_distance 1.0 — the maximum attainable — so a failed inference was
+    # previously guaranteed to top its slice and be flagged.  Quarantine them.
+    df_unscorable: pd.DataFrame = pd.DataFrame()
+    if quality_gate:
+        df, df_unscorable, qreport = validate_embeddings(df, embedding_col="embedding")
+        if qreport.n_rejected:
+            print(f"[anomaly] Embedding quality gate: {qreport}")
+            print(qreport.to_frame().to_string(index=False))
+        else:
+            print(f"[anomaly] Embedding quality gate: all {qreport.n_total:,} rows OK")
+
+    # ------------------------------------------------------------------
+    # 5a-ii. Rows whose ewoc_code is absent from the legend
+    # ------------------------------------------------------------------
+    # These used to be silently dropped by dropna(), which meant they never
+    # received anomaly columns — so every subsequent `--mode update` run
+    # rediscovered them as "unscored" and re-expanded the impact zone, and the
+    # incremental pathway never converged.  Hold them aside explicitly and give
+    # them the terminal `unmapped` state at the end.
     count_before_drop = len(df)
-    print(f"[anomaly] count_before_drop: {count_before_drop:,}")
-    df = df.dropna(subset=label_cols).copy()
-    count_after_drop = len(df)
-    print(f"[anomaly] count_after_drop: {count_after_drop:,}")
-    print(
-        f"[anomaly] Dropped {count_before_drop - count_after_drop:,} rows with "
-        f"missing label columns {label_cols} and dropped!"
-    )
+    unmapped_mask = df[label_cols].isna().any(axis=1)
+    df_unmapped = df[unmapped_mask].copy()
+    df = df[~unmapped_mask].copy()
+    if len(df_unmapped):
+        codes = (
+            df_unmapped["ewoc_code"].astype(str).value_counts().head(15)
+            if "ewoc_code" in df_unmapped.columns
+            else pd.Series(dtype=int)
+        )
+        print(
+            f"[anomaly] {len(df_unmapped):,} of {count_before_drop:,} rows have no "
+            f"mapping to {label_cols} — held aside as 'unmapped' (NOT silently "
+            "dropped). This is a legend-coverage gap, not a data quirk."
+        )
+        if len(codes):
+            print(f"[anomaly] Most frequent unmapped ewoc_codes:\n{codes.to_string()}")
+    print(f"[anomaly] count_after_drop: {len(df):,}")
 
     label_col = label_cols[0]
-    slice_keys = [*group_cols, h3_level_name, label_col]
+
+    # ------------------------------------------------------------------
+    # 5a-iii. Temporal key
+    # ------------------------------------------------------------------
+    # Embeddings are season-specific and the reference collection spans many
+    # years, so comparing a 2018 sample against a 2021 neighbourhood measures
+    # phenology, not label error.  When a time column is available it joins
+    # the slice key so points are only compared within the same period.
+    time_keys: list[str] = []
+    if time_col:
+        if time_col in df.columns:
+            df[time_col] = df[time_col].astype(str)
+            time_keys = [time_col]
+            print(
+                f"[anomaly] Temporal control ON: '{time_col}' joins the slice and "
+                f"context keys ({df[time_col].nunique():,} distinct periods)"
+            )
+        else:
+            print(
+                f"[anomaly] WARNING: time_col='{time_col}' is not present in the "
+                "loaded embeddings, so TEMPORAL CONTROL IS INACTIVE for this run. "
+                "The standard embeddings_cache schema carries no temporal column "
+                "(sample_id, model_hash, ref_id, ewoc_code, h3_l3_cell, lat, lon, "
+                "embedding_*), so it must be added when the cache is built — or "
+                "the embeddings passed in via embeddings_df=. Scoring will "
+                "compare across periods, which inflates distances for samples "
+                "from minority years."
+            )
+
+    slice_keys = [*group_cols, h3_level_name, label_col, *time_keys]
 
     # ------------------------------------------------------------------
     # 5b. Adaptive H3 level assignment (if h3_level is a list)
@@ -691,13 +1031,13 @@ def run_pipeline(
             df,
             h3_levels=h3_levels,
             label_col=label_col,
-            group_cols=group_cols,
+            group_cols=[*group_cols, *time_keys],
             min_slice_size=min_slice_size,
             max_slice_size=max_slice_size,
         )
         # h3_level_name is already "effective_h3_cell" for adaptive mode
         # Update slice_keys to use the effective cell
-        slice_keys = [*group_cols, h3_level_name, label_col]
+        slice_keys = [*group_cols, h3_level_name, label_col, *time_keys]
 
     # ------------------------------------------------------------------
     # 6. Merge small slices
@@ -713,13 +1053,15 @@ def run_pipeline(
             min_size=min_slice_size,
             label_col=label_col,
             h3_level_name=h3_level_name,
-            group_cols=group_cols,
+            group_cols=[*group_cols, *time_keys],
             max_iterations=max_merge_iterations,
         )
         _n_slices_after_merge = df.groupby(slice_keys).ngroups
         print(f"[anomaly] After merge: {_n_slices_after_merge:,} slices")
     else:
         print("[anomaly] Skipping merge_small_slices for coarse H3 level")
+        df["context_h3_cell"] = df[h3_level_name].astype(str)
+        df["merge_steps"] = np.uint8(0)
 
     # ------------------------------------------------------------------
     # 7. Hierarchical ref-class assignment + context centroid metrics
@@ -727,7 +1069,7 @@ def run_pipeline(
     df = _add_hierarchical_ref_outlier_class(
         df,
         label_cols=label_cols,
-        group_cols=group_cols,
+        group_cols=[*group_cols, *time_keys],
         h3_level_name=h3_level_name,
         min_slice_size=min_slice_size,
         out_ref_class_col="ref_outlier_class",
@@ -736,14 +1078,46 @@ def run_pipeline(
     )
 
     # adding context centroid metrics
+    #
+    # IMPORTANT: context metrics are computed on ``context_h3_cell`` — the
+    # *pre-merge* cell — not on the post-merge scoring cell.  Merging is decided
+    # per (cell, label), so after it the post-merge cell is no longer a
+    # geographic neighbourhood: maize may have moved to a different cell than
+    # wheat, and "the other classes near me" became an arbitrary label-dependent
+    # set.  The alt-class margin and kNN purity were therefore not measuring
+    # what their docstrings claimed.
     print("[anomaly] Computing context centroid metrics...")
-    context_cols = [*group_cols, h3_level_name]
+    context_cell = "context_h3_cell" if "context_h3_cell" in df.columns else h3_level_name
+    # The context deliberately does NOT include group_cols.
+    #
+    # A *slice* is per-dataset (group_cols=["ref_id"]) so that one dataset's
+    # labelling convention cannot contaminate another's reference cloud.  But
+    # the *context* answers "what else is on the ground around this point?",
+    # and that question is geographic: restricting it to the same ref_id makes
+    # the auxiliary evidence collapse for single-crop datasets — every point
+    # trivially has kNN purity 1.0 and there is no alternative class centroid to
+    # measure a margin against.  With the group_cols default now ["ref_id"],
+    # keeping group_cols in the context would have silently disabled the purity
+    # and margin votes across a large part of the collection.
+    context_cols = [*context_group_cols, context_cell, *time_keys]
     df = add_alt_class_centroid_metrics(
         df,
         label_col=label_col,
         context_cols=context_cols,
         embedding_col="embedding",
     )
+
+    # Temporal-minority diagnostic: how rare is this sample's period inside its
+    # own context?  A high value means its distance is likely driven by
+    # phenology rather than by a wrong label.
+    if time_keys:
+        tk = time_keys[0]
+        spatial_context_cols = [*group_cols, context_cell]
+        ctx_size = df.groupby(spatial_context_cols, dropna=False)[tk].transform("size")
+        same_period = df.groupby(context_cols, dropna=False)[tk].transform("size")
+        df["time_minority_frac"] = (
+            1.0 - (same_period / ctx_size.replace(0, np.nan))
+        ).astype(np.float32)
 
     # ------------------------------------------------------------------
     # 8. Scoring
@@ -756,7 +1130,7 @@ def run_pipeline(
         scored_df = score_slices_hierarchical(
             df,
             label_cols=label_cols,
-            group_cols=group_cols,
+            group_cols=[*group_cols, *time_keys],
             h3_level_name=h3_level_name,
             min_slice_size=min_slice_size,
             norm_percentiles=norm_percentiles,
@@ -765,6 +1139,7 @@ def run_pipeline(
             ref_class_col="ref_outlier_class",
             centroid_mode=centroid_mode,
             centroid_trim=centroid_trim,
+            min_scoring_slice_size=min_scoring_slice_size,
         )
     else:
         # Single-level scoring path
@@ -773,55 +1148,51 @@ def run_pipeline(
             df,
             label_col=label_col,
             h3_level_name=h3_level_name,
-            group_cols=group_cols,
+            group_cols=[*group_cols, *time_keys],
             centroid_mode=centroid_mode,
             centroid_trim=centroid_trim,
         )
 
         df_with_centroid = df.merge(
             centroids,
-            on=[*group_cols, h3_level_name, label_col],
+            on=slice_keys,
             how="left",
         )
 
         def _score_group(g: pd.DataFrame) -> pd.DataFrame:
+            g = g.copy()
             g["slice_n"] = len(g)
-            if len(g) < MIN_SCORING_SLICE_SIZE:
-                g = g.copy()
+            if len(g) < int(min_scoring_slice_size):
+                # Too small to score.  NaN (not 0.0) plus scored=False, so the
+                # row ends up as an explicit `unscored` flag rather than being
+                # reported as `normal` — "we did not look" must not read as
+                # "we looked and it is fine".
                 g = g[[c for c in g.columns if "embedding" not in c]]
-                g["cosine_distance"] = 0.0
-                g["knn_distance"] = 0.0
-                g["cos_norm"] = 0.0
-                g["knn_norm"] = 0.0
-                g["S"] = 0.0
-                g["rank_percentile"] = 0.0
-                g["S_rank_min"] = 0.0
-                g["cos_rank"] = 0.0
-                g["knn_rank"] = 0.0
-                g["S_rank"] = 0.0
-                g["cos_z"] = 0.0
-                g["knn_z"] = 0.0
-                g["S_z"] = 0.0
-                g["mean_score"] = 0.0
-                g["confidence"] = 0.99
+                for c in _SCORE_COLS:
+                    g[c] = np.nan
+                g["scored"] = False
                 return g
 
-            return compute_scores_for_slice(
+            out = compute_scores_for_slice(
                 g,
                 centroid=g["centroid"].iloc[0],
                 norm_percentiles=norm_percentiles,
                 max_full_pairwise_n=max_full_pairwise_n,
                 force_knn=False,
                 knn_k=10,
+                centroid_mode=centroid_mode,
+                centroid_trim=centroid_trim,
             )
+            out["scored"] = True
+            return out
 
         from tqdm import tqdm as tqdm_cls
 
-        groups = list(df_with_centroid.groupby(slice_keys, group_keys=False))
+        # sort=True keeps group iteration order deterministic across runs.
+        groups = list(df_with_centroid.groupby(slice_keys, sort=True))
         results = []
         with tqdm_cls(groups, desc="Scoring slices", unit="slice") as pbar:
             for key, group in pbar:
-                # key is a tuple matching slice_keys; last element is the label
                 label_val = key[-1] if isinstance(key, tuple) else key
                 n_pts = len(group)
                 pbar.set_postfix_str(f"{n_pts:,} pts | {label_val}", refresh=False)
@@ -834,6 +1205,62 @@ def run_pipeline(
     # scored_df = scored_df.drop(columns=["embedding", "base_embedding"], errors="ignore")
     scored_df = scored_df.drop(columns=["base_embedding"], errors="ignore")
 
+    if "scored" not in scored_df.columns:
+        scored_df["scored"] = True
+    n_unscored = int((~scored_df["scored"].fillna(False).astype(bool)).sum())
+    if n_unscored:
+        print(
+            f"[anomaly] {n_unscored:,} rows ({n_unscored / max(len(scored_df), 1):.1%}) "
+            f"sit in slices below min_scoring_slice_size={min_scoring_slice_size} and "
+            "cannot be scored — they will be reported as 'unscored', not 'normal'."
+        )
+
+    # ------------------------------------------------------------------
+    # 8b. Absolute-scale calibration
+    # ------------------------------------------------------------------
+    # Convert the raw distances into z-scores against a null pooled ACROSS
+    # slices of the same class.  This is what makes a flag mean the same thing
+    # everywhere: without it, every slice is min-max normalised onto [0, 1] and
+    # therefore yields the same proportion of "suspects" whether it is clean or
+    # 30 % mislabelled.
+    null_keys = [label_col, *(list(null_extra_keys) if null_extra_keys else [])]
+    null_keys = [k for k in null_keys if k in scored_df.columns]
+
+    n_scorable = int(scored_df["scored"].fillna(False).astype(bool).sum())
+    if n_scorable == 0:
+        # Every slice was below min_scoring_slice_size. That is a legitimate
+        # (if uninformative) outcome — typically a very sparse region — so it
+        # must not crash the run. Emit NaN evidence; nothing can be flagged.
+        print(
+            "[anomaly] No slice is large enough to score — skipping calibration. "
+            "All rows will be reported as 'unscored'."
+        )
+        scored_df["abs_z"] = np.nan
+        scored_df["cos_abs_z"] = np.nan
+        scored_df["neighbour_abs_z"] = np.nan
+        scored_df["null_scale_sigma"] = np.nan
+    else:
+        print(f"[anomaly] Calibrating absolute scale (null keys: {null_keys}) ...")
+        null_ref = compute_null_reference(
+            scored_df,
+            null_keys=null_keys,
+            slice_key_cols=slice_keys,
+            min_slice_n=max(int(min_scoring_slice_size), 30),
+            scored_mask_col="scored",
+        )
+        scored_df = add_absolute_scores(
+            scored_df, null_ref, null_keys=null_keys, combine=abs_combine
+        )
+        _z_equiv = suggest_abs_z_threshold(
+            scored_df, target_flag_fraction=0.02, scored_mask_col="scored"
+        )
+        _over = float(np.nanmean(scored_df["abs_z"].to_numpy() >= abs_z_k))
+        print(
+            f"[anomaly] abs_z gate = {abs_z_k} sigma "
+            f"(a flat 2% budget would correspond to z = {_z_equiv:.2f}); "
+            f"{_over:.2%} of rows exceed the gate before the within-slice test"
+        )
+
     # ------------------------------------------------------------------
     # 9. Flagging
     # ------------------------------------------------------------------
@@ -842,7 +1269,7 @@ def run_pipeline(
         scored_df,
         label_col=label_col,
         h3_level_name=h3_level_name,
-        group_cols=group_cols,
+        group_cols=[*group_cols, *time_keys],
         threshold_mode=threshold_mode,
         percentile_q=percentile_q,
         mad_k=mad_k,
@@ -850,6 +1277,16 @@ def run_pipeline(
         fdr_alpha=fdr_alpha,
         min_flagged_per_slice=min_flagged_per_slice,
         max_flagged_fraction=max_flagged_fraction,
+        abs_z_col="abs_z",
+        abs_z_k=abs_z_k,
+        require_absolute=require_absolute,
+        scored_mask_col="scored",
+    )
+    _n_flagged = int(flagged_df["flagged"].sum())
+    print(
+        f"[anomaly] Flagged {_n_flagged:,} / {len(flagged_df):,} "
+        f"({_n_flagged / max(len(flagged_df), 1):.2%})"
+        + ("" if require_absolute else "  [absolute gate DISABLED — relative only]")
     )
 
     # ------------------------------------------------------------------
@@ -870,17 +1307,15 @@ def run_pipeline(
         flagged_col="flagged" if gate_confidence_by_flag else None,
     )
 
-    # Boost confidence for undersized slices
-    small = flagged_df["slice_n"] < MIN_SCORING_SLICE_SIZE
-    flagged_df.loc[small, "confidence"] = np.maximum(
-        flagged_df.loc[small, "confidence"].to_numpy(), 0.95
-    ).astype(np.float32)
+    # Never down-weight a row we could not score.
+    unscored_mask = ~flagged_df["scored"].fillna(False).to_numpy(dtype=bool)
+    flagged_df.loc[unscored_mask, "confidence"] = 1.0
 
     # ------------------------------------------------------------------
     # 11. kNN label purity + confidence fusion
     # ------------------------------------------------------------------
+    # Purity is computed on the PRE-merge context cell (see section 7).
     print("[anomaly] Computing kNN label purity for flagged points...")
-    context_cols = [*group_cols, h3_level_name]
     flagged_df = add_knn_label_purity_for_flagged(
         df_all=df,              # this df still has embeddings
         flagged_df=flagged_df,  # from flag_anomalies
@@ -894,10 +1329,26 @@ def run_pipeline(
     print("[anomaly] Applying confidence fusion...")
     flagged_df = apply_confidence_fusion(flagged_df)  # produces confidence_alt
 
+    # Fold the auxiliary signals into the SHIPPED confidence.
+    #
+    # Previously `confidence_alt` was computed here — at the cost of a kNN per
+    # context group — and then never read again: run_pipeline renamed only
+    # `confidence` to `confidence_nonoutlier`, and the CLI kept just that
+    # column.  The margin and purity evidence therefore had exactly zero
+    # influence on the output.  Wire it through.
+    if apply_confidence_fusion_to_output and "confidence_alt" in flagged_df.columns:
+        flagged_df["confidence_base"] = flagged_df["confidence"].astype(np.float32)
+        flagged_df["confidence"] = flagged_df["confidence_alt"].astype(np.float32)
+
     # ------------------------------------------------------------------
     # 12. Anomaly categorization
     # ------------------------------------------------------------------
-    flagged_df = _assign_anomaly_categories(flagged_df)
+    flagged_df = _assign_anomaly_categories(
+        flagged_df,
+        abs_z_suspect=abs_z_suspect,
+        abs_z_candidate=abs_z_candidate,
+        purity_veto=purity_veto,
+    )
 
     # ------------------------------------------------------------------
     # 12b. Slice-trust gating
@@ -939,6 +1390,37 @@ def run_pipeline(
     # ------------------------------------------------------------------
     # 13. Final cleanup & output
     # ------------------------------------------------------------------
+    # Re-attach the rows that were held aside before scoring, each with an
+    # explicit terminal state.  Previously the quarantined populations either
+    # did not exist (quality gate) or were silently dropped (unmapped codes),
+    # which is what made the incremental update pathway rediscover them forever.
+    def _reattach(extra: pd.DataFrame, flag_value: str) -> None:
+        nonlocal flagged_df
+        if extra is None or extra.empty:
+            return
+        extra = extra.drop(columns=embed_cols, errors="ignore")
+        extra = extra.drop(columns=["embedding", "base_embedding"], errors="ignore")
+        for col in flagged_df.columns:
+            if col not in extra.columns:
+                extra[col] = np.nan
+        # Preserve WHY a row was rejected.  Without this the output says
+        # "unscorable" with no way to tell a failed encoder run from a duplicate
+        # id — the triage the quality gate exists to enable.
+        if "quality_reason" in extra.columns and "quality_reason" not in flagged_df.columns:
+            flagged_df["quality_reason"] = pd.NA
+        extra["S_anomaly"] = flag_value
+        extra["combined_anomaly"] = flag_value
+        extra["flagged"] = False
+        extra["scored"] = False
+        # Never down-weight a sample the detector could not judge.
+        extra["confidence"] = 1.0
+        extra = extra.reindex(columns=flagged_df.columns)
+        flagged_df = pd.concat([flagged_df, extra], axis=0, ignore_index=True)
+        print(f"[anomaly] Re-attached {len(extra):,} rows as '{flag_value}'.")
+
+    _reattach(df_unscorable, "unscorable")
+    _reattach(df_unmapped, "unmapped")
+
     # Re-attach skipped-class rows with NaN for all score/outlier columns
     if not df_skipped.empty:
         # Drop raw embedding columns from skipped rows (not needed in output)
@@ -961,9 +1443,22 @@ def run_pipeline(
         for col in flagged_df.columns:
             if col not in df_skipped.columns:
                 df_skipped[col] = np.nan
+        # Terminal state, not NaN.  `find_unscored_samples` decides "already
+        # handled" from the flag column, and NaN is never terminal — so these
+        # rows were rediscovered as unscored on every `--mode update`.  With
+        # skip_classes=["ignore"] covering roughly half of CROPTYPE24, that is a
+        # large recurring cost, and it only avoided non-convergence because
+        # `_discover_domain_impact` happened to filter them by ewoc_code as well.
+        df_skipped["S_anomaly"] = "skipped"
+        df_skipped["combined_anomaly"] = "skipped"
+        df_skipped["flagged"] = False
+        df_skipped["scored"] = False
+        df_skipped["confidence"] = 1.0
         df_skipped = df_skipped.reindex(columns=flagged_df.columns)
         flagged_df = pd.concat([flagged_df, df_skipped], axis=0, ignore_index=True)
-        print(f"[anomaly] Re-attached {len(df_skipped):,} skipped-class rows with NaN scores.")
+        print(
+            f"[anomaly] Re-attached {len(df_skipped):,} skipped-class rows as 'skipped'."
+        )
 
     # Convert float64 → float32 to reduce output size
     for c in flagged_df.select_dtypes(include=["float64"]).columns:
@@ -976,27 +1471,24 @@ def run_pipeline(
     # ["cosine_distance", "knn_distance", "cos_norm", "knn_norm",
     #              "cos_rank", "knn_rank", "S_rank", "S_rank_min",
     #              "cos_z", "knn_z", "S_z", "mean_score"]
+    # Columns dropped from the review output.
+    #
+    # The evidence behind a flag is deliberately RETAINED now: abs_z, the raw
+    # distances, the kNN purity, the alt-class margin and the vote count all
+    # survive.  Previously every one of these was dropped here, so a reviewer
+    # opening a flagged point on a basemap had no way to see *why* it was
+    # flagged and no way to tell a strong flag from a marginal one — which is
+    # precisely the audit that was needed to catch the false positives.
     drop_cols = [
         "centroid",
-        "cosine_distance",
-        "knn_distance",
         "cos_norm",
         "knn_norm",
         "cos_rank",
         "knn_rank",
-        "cos_z",
-        "knn_z",
         "p_margin",
         "p_purity",
-        "self_centroid_dist_ctx",
-        "alt_centroid_dist_ctx",
-        "knn_same_label_frac_ctx",
-        "knn_majority_frac_ctx",
-        "rank_percentile",
     ]
-    # drop_cols = [c for c in drop_cols if c in flagged_gdf.columns]
     embed_raw = [c for c in flagged_gdf.columns if c.startswith("embedding_")]
-    # drop_cols = [] + embed_raw
     drop_cols += embed_raw
     flagged_gdf = flagged_gdf.drop(columns=drop_cols, errors="ignore")
 
@@ -1010,6 +1502,51 @@ def run_pipeline(
             flagged_gdf, summary_df, slice_keys,
             output_samples_path, output_summary_path,
         )
+
+    # ------------------------------------------------------------------
+    # 14. Dataset-level rollup
+    # ------------------------------------------------------------------
+    # Point-wise flags dilute systematic error: a whole ref_id digitised
+    # against the wrong legend shows up as a slightly raised flag rate across
+    # thousands of points rather than as one actionable finding — and once the
+    # errors approach half of a class in a region, point-wise geometry cannot
+    # resolve them at all.  robust_extensions.aggregate_parcel_scores existed
+    # for exactly this and was never called from the pipeline.  Emit the rollup
+    # so a systematically-off dataset is visible at the level it occurs.
+    if "ref_id" in flagged_gdf.columns:
+        try:
+            _roll = (
+                flagged_gdf.assign(
+                    _is_flagged=flagged_gdf["anomaly_flag"].isin(
+                        ["flagged", "suspect", "candidate"]
+                    )
+                )
+                .groupby("ref_id")
+                .agg(
+                    n=("sample_id", "size"),
+                    flag_rate=("_is_flagged", "mean"),
+                    median_abs_z=("abs_z", "median"),
+                )
+                .reset_index()
+                .sort_values("flag_rate", ascending=False)
+            )
+            _median_rate = float(_roll["flag_rate"].median())
+            _suspicious = _roll[_roll["flag_rate"] > max(3.0 * _median_rate, 0.05)]
+            print(
+                f"[anomaly] Dataset rollup: median ref_id flag rate "
+                f"{_median_rate:.2%}; {len(_suspicious)} ref_id(s) above 3x that."
+            )
+            if len(_suspicious):
+                print(_suspicious.head(10).to_string(index=False))
+            if output_summary_path and write_outputs:
+                _roll.to_parquet(
+                    Path(output_summary_path).with_name(
+                        Path(output_summary_path).stem + "_by_ref_id.parquet"
+                    ),
+                    index=False,
+                )
+        except Exception as exc:  # diagnostics must never break a run
+            print(f"[anomaly] Dataset rollup skipped: {type(exc).__name__}: {exc}")
 
     if con is not None:
         con.close()

@@ -24,7 +24,11 @@ The anomaly columns produced by the pipeline (see
 ``EBA_detector.anomaly_utils.ANOMALY_COLUMNS`` and
 ``worldcereal.train.OUTLIER_COLUMNS``) are:
 
-* ``*_anomaly_flag``           : ``normal|flagged|suspect|candidate``
+* ``*_anomaly_flag``           : ``normal|flagged|suspect|candidate`` plus the
+  non-judged terminal states ``unscored|unscorable|unmapped|skipped`` (rows the
+  detector could not form an opinion about).  Those are deliberately absent
+  from every ``DROP_SETS`` entry: "we did not look" must never cause a training
+  sample to be removed.
 * ``*_confidence_nonoutlier``  : continuous P(not outlier) in [0, 1]
 """
 
@@ -43,6 +47,13 @@ FLAG_SEVERITY: Dict[str, int] = {
     "suspect": 2,
     "candidate": 3,
 }
+
+# Terminal states that are NOT positions on the severity ladder: the detector
+# could not judge the sample (slice too small, embedding rejected, code absent
+# from the legend) or was told to skip it.  Never map these to 0 — treating
+# "unscored" as "normal" is precisely the conflation these states exist to
+# remove.  Keep them, and report them separately.
+NON_JUDGED_FLAGS: set = {"unscored", "unscorable", "unmapped", "skipped"}
 
 # Which categories are removed for each hard-drop level (matches
 # worldcereal.train.finetuning_utils.identify_true_outliers).

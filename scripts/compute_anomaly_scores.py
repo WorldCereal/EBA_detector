@@ -242,12 +242,36 @@ class AnomalyRunConfig:
     max_slice_size: Optional[int]
     merge_small_slice: bool = True
     max_merge_iterations: int = 16
-    threshold_mode: str = "mad"
-    mad_k: float = 4.0
+    threshold_mode: str = "stable_mad"
+    mad_k: float = 3.0
     percentile_q: float = 0.96
     max_full_pairwise_n: int = 0
     norm_percentiles: Tuple[float, float] = (2.0, 98.0)
     skip_classes: Optional[List[str]] = field(default_factory=lambda: ["ignore"])
+    # --- slice definition -------------------------------------------------
+    # group_cols was previously hard-coded to None here while the README and
+    # anomaly.py's __main__ both used ["ref_id"].  That silently changed the
+    # semantics of every production run: slices pooled across all source
+    # datasets, so a dataset digitised against a different legend either masked
+    # itself (if large) or was flagged wholesale (if small).  It is now an
+    # explicit, documented choice.
+    group_cols: Optional[List[str]] = field(default_factory=lambda: ["ref_id"])
+    # Context for the auxiliary (purity / margin) signals. Geographic by
+    # default: it must NOT inherit group_cols, or single-crop datasets lose
+    # those votes entirely. See run_pipeline section 7.
+    context_group_cols: Optional[List[str]] = field(default_factory=list)
+    time_col: Optional[str] = None
+    # --- absolute-scale gate ---------------------------------------------
+    require_absolute: bool = True
+    abs_z_k: float = 3.0
+    abs_z_suspect: float = 4.0
+    abs_z_candidate: float = 5.5
+    abs_combine: str = "min"
+    # --- support / quality ------------------------------------------------
+    min_scoring_slice_size: int = 50
+    quality_gate: bool = True
+    strict_quality: bool = False
+    purity_veto: float = 0.80
     # Final output column names
     confidence_col_name: str = "confidence_nonoutlier"
     anomaly_flag_col_name: str = "anomaly_flag"
@@ -769,7 +793,18 @@ def run_single_domain_scoring(
             skip_classes=config.skip_classes,
             mapping_file=class_mappings,
             h3_level=config.h3_levels,
-            group_cols=None,
+            group_cols=config.group_cols,
+            context_group_cols=config.context_group_cols,
+            time_col=config.time_col,
+            require_absolute=config.require_absolute,
+            abs_z_k=config.abs_z_k,
+            abs_z_suspect=config.abs_z_suspect,
+            abs_z_candidate=config.abs_z_candidate,
+            abs_combine=config.abs_combine,
+            min_scoring_slice_size=config.min_scoring_slice_size,
+            quality_gate=config.quality_gate,
+            strict_quality=config.strict_quality,
+            purity_veto=config.purity_veto,
             min_slice_size=config.min_slice_size,
             max_slice_size=config.max_slice_size,
             merge_small_slice=config.merge_small_slice,
@@ -1142,10 +1177,17 @@ def _discover_domain_impact(
     """
     logger.info(f"[update/{domain_label}] Scanning for unscored samples "
                 f"(checking {domain_anomaly_cols}) ...")
+    # flag_col makes the "is this row already handled?" test decision-based:
+    # a row carrying a terminal flag (including 'unscored' / 'unscorable' /
+    # 'unmapped') counts as handled even though some numeric columns are null.
+    # The old "any column is NaN" rule meant those rows were rediscovered on
+    # every update run and the impact zone grew without ever converging.
+    _flag_cols = [c for c in domain_anomaly_cols if c.endswith("_anomaly_flag")]
     unscored = find_unscored_samples(
         long_parquet_dir=long_parquet_dir,
         anomaly_cols=domain_anomaly_cols,
         parquet_glob=parquet_glob,
+        flag_col=_flag_cols[0] if _flag_cols else None,
     )
     if unscored.empty:
         logger.info(f"[update/{domain_label}] No unscored samples — skipping domain.")
@@ -1824,7 +1866,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     lc10.add_argument("--lc10-min-slice-size",       type=int, default=200)
     lc10.add_argument("--lc10-max-slice-size",       type=int, default=10_000)
     lc10.add_argument("--lc10-max-merge-iterations", type=int, default=16)
-    lc10.add_argument("--lc10-mad-k",                type=float, default=4.0)
+    lc10.add_argument("--lc10-mad-k",                type=float, default=3.0)
 
     # CTY24 scoring
     cty = p.add_argument_group("CROPTYPE24 scoring")
@@ -1840,17 +1882,74 @@ def build_arg_parser() -> argparse.ArgumentParser:
     cty.add_argument("--cty24-min-slice-size",        type=int, default=100)
     cty.add_argument("--cty24-max-slice-size",        type=int, default=5_000)
     cty.add_argument("--cty24-max-merge-iterations",  type=int, default=8)
-    cty.add_argument("--cty24-mad-k",                 type=float, default=4.0)
+    cty.add_argument("--cty24-mad-k",                 type=float, default=3.0)
 
     # Common scoring
     common = p.add_argument_group("common scoring")
-    common.add_argument("--threshold-mode",      type=str, default="mad")
+    common.add_argument("--threshold-mode",      type=str, default="stable_mad",
+                        choices=["stable_mad", "mad", "percentile", "absolute", "fdr"],
+                        help=("stable_mad (default) uses the slice median as the local\n"
+                              "reference but the CROSS-SLICE sigma as the dispersion, so a\n"
+                              "contaminated slice cannot inflate its own threshold. Plain\n"
+                              "mad is the legacy behaviour and collapses to zero detections\n"
+                              "at high contamination."))
     common.add_argument("--percentile-q",        type=float, default=0.96)
     common.add_argument("--norm-percentiles",    type=float, nargs=2, default=[2.0, 98.0],
                         metavar=("LO", "HI"))
     common.add_argument("--fdr-alpha",           type=float, default=0.05)
     common.add_argument("--skip-classes",        type=str, nargs="+", default=["ignore"])
     common.add_argument("--max-full-pairwise-n", type=int, default=0)
+    common.add_argument(
+        "--group-cols", type=str, nargs="*", default=["ref_id"],
+        help=(
+            "Extra columns that join the slice key, on top of the H3 cell and "
+            "the label. Default ['ref_id'] scores each source dataset against "
+            "itself, matching the README and anomaly.py's __main__. Pass an "
+            "empty list to pool across datasets (the previous hard-coded CLI "
+            "behaviour) — note that pooling lets a dataset with its own "
+            "labelling convention either mask itself or be flagged wholesale."
+        ),
+    )
+    common.add_argument(
+        "--time-col", type=str, default=None,
+        help=(
+            "Optional temporal column (e.g. 'year' or a season id) that joins "
+            "the slice and context keys. Embeddings are season-specific and the "
+            "reference collection spans many years, so without this a sample "
+            "from a minority year is distant for phenological rather than label "
+            "reasons — a major source of false positives."
+        ),
+    )
+
+    absg = p.add_argument_group("absolute-scale gate")
+    absg.add_argument(
+        "--no-absolute-gate", action="store_true",
+        help=(
+            "Disable the cross-slice absolute gate and flag on within-slice "
+            "rank alone (the legacy behaviour). Only useful for ablations: "
+            "without it, the top ~2%% of EVERY slice reaches the escalation "
+            "thresholds whether or not the slice contains a single error."
+        ),
+    )
+    absg.add_argument("--abs-z-k",         type=float, default=3.0,
+                      help="Robust sigma required to flag (default 3.0).")
+    absg.add_argument("--abs-z-suspect",   type=float, default=4.0)
+    absg.add_argument("--abs-z-candidate", type=float, default=5.5)
+    absg.add_argument("--abs-combine",     type=str, default="min",
+                      choices=["min", "max", "mean"],
+                      help=("How to combine the centroid-distance and kNN-distance "
+                            "z-scores. 'min' (default) demands both."))
+    absg.add_argument("--purity-veto", type=float, default=0.80,
+                      help=("Cap escalation at 'flagged' when this fraction of a "
+                            "point's neighbours share its label. Set 1.1 to disable."))
+    absg.add_argument("--min-scoring-slice-size", type=int, default=50,
+                      help=("Slices smaller than this are reported as 'unscored' "
+                            "rather than 'normal'."))
+    absg.add_argument("--strict-quality", action="store_true",
+                      help=("Hard-error on mixed model_hash or H3/coordinate "
+                            "mismatch instead of warning."))
+    absg.add_argument("--no-quality-gate", action="store_true",
+                      help="Skip embedding validation (not recommended).")
 
     # Update-specific
     upd = p.add_argument_group("update mode")
@@ -1955,6 +2054,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         norm_percentiles=tuple(args.norm_percentiles),
         skip_classes=args.skip_classes,
         max_full_pairwise_n=args.max_full_pairwise_n,
+        group_cols=list(args.group_cols or []),
+        time_col=args.time_col,
+        require_absolute=not bool(args.no_absolute_gate),
+        abs_z_k=args.abs_z_k,
+        abs_z_suspect=args.abs_z_suspect,
+        abs_z_candidate=args.abs_z_candidate,
+        abs_combine=args.abs_combine,
+        purity_veto=args.purity_veto,
+        min_scoring_slice_size=args.min_scoring_slice_size,
+        quality_gate=not bool(args.no_quality_gate),
+        strict_quality=bool(args.strict_quality),
     )
     lc10_config = AnomalyRunConfig(
         label_domain=args.lc10_class_mapping,

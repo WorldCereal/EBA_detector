@@ -50,9 +50,14 @@ def main() -> None:
     p.add_argument("--modes", nargs="+", default=["within_context", "random", "parcel"])
     p.add_argument("--rates", type=float, nargs="+", default=[0.02, 0.05, 0.10, 0.20])
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
-    p.add_argument("--score-col", default="mean_score", choices=["S", "mean_score"],
-                   help="Detector ranking score. mean_score is what the shipped "
-                        "confidence_nonoutlier is built from; S is the raw distance.")
+    p.add_argument("--score-col", default="abs_z",
+                   choices=["abs_z", "S", "mean_score"],
+                   help="Detector ranking score. abs_z (default) is the "
+                        "cross-slice-calibrated evidence the shipped flag rule "
+                        "uses. mean_score and S are within-slice relative "
+                        "quantities: they are uniform by construction, so a "
+                        "global AUROC computed on them mostly measures slice "
+                        "composition rather than detection quality.")
     p.add_argument("--baseline", default=None,
                    choices=["global", "iforest", "lof", "spatial"],
                    help="Score with a reference detector instead of EBA: "

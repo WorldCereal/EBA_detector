@@ -70,9 +70,15 @@ class TestRobustCentroid:
 
     def test_median_mode_and_small_slice(self):
         rng = np.random.RandomState(1)
-        X = rng.randn(3, 8).astype(np.float32)
-        # n < 5 falls back to mean
-        assert np.allclose(robust_centroid(X, mode="trimmed"), X.mean(0))
+        X = rng.randn(2, 8).astype(np.float32)
+        # n < 3 falls back to the (spherical) mean: with normalize=True the
+        # centroid is the mean of the L2-normalised rows, which is the correct
+        # reference for the cosine distances used everywhere downstream.
+        Xn = X / np.linalg.norm(X, axis=1, keepdims=True)
+        assert np.allclose(robust_centroid(X, mode="trimmed"), Xn.mean(0), atol=1e-6)
+        assert np.allclose(
+            robust_centroid(X, mode="trimmed", normalize=False), X.mean(0), atol=1e-6
+        )
         med = robust_centroid(rng.randn(40, 8).astype(np.float32), mode="median")
         assert med.shape == (8,)
 
@@ -112,7 +118,10 @@ class TestMadDegeneracy:
             "S": s, "ewoc_code": ["c"] * 100, "h3_l3_cell": ["x"] * 100,
             "S_rank": s, "S_rank_min": s, "S_z": s,
         })
-        flagged, _ = flag_anomalies(df, label_col="ewoc_code", threshold_mode="mad", mad_k=3.0)
+        flagged, _ = flag_anomalies(
+            df, label_col="ewoc_code", threshold_mode="mad", mad_k=3.0,
+            require_absolute=False,
+        )
         assert flagged["flagged"].sum() == 0
 
 

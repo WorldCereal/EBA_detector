@@ -14,6 +14,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from EBA_detector.calibration import (
+    add_absolute_scores,
+    compute_null_reference,
+)
 from EBA_detector.anomaly_utils import (
     MIN_SCORING_SLICE_SIZE,
     _SCORE_COLS,
@@ -307,7 +311,12 @@ class TestComputeScoresForSlice:
 
         result = _score_group_simple(df, norm_percentiles=(5.0, 95.0), max_full_pairwise_n=None)
         for col in _SCORE_COLS:
-            assert (result[col] == 0.0).all(), f"{col} should be all zeros for small slice"
+            # Slices below min_scoring_slice_size are NOT scored. They now carry
+            # NaN plus scored=False, so downstream they surface as an explicit
+            # `unscored` flag. Writing 0.0 here used to make "we did not look"
+            # indistinguishable from "we looked and it is fine".
+            assert result[col].isna().all(), f"{col} should be NaN for an unscored slice"
+        assert not result["scored"].any()
 
 
 # ===================================================================
@@ -415,6 +424,7 @@ class TestFlagAnomalies:
             label_col="ewoc_code",
             threshold_mode="percentile",
             percentile_q=0.95,
+            require_absolute=False,
         )
         assert "flagged" in flagged.columns
         assert flagged["flagged"].sum() > 0
@@ -426,6 +436,7 @@ class TestFlagAnomalies:
             label_col="ewoc_code",
             threshold_mode="mad",
             mad_k=2.0,
+            require_absolute=False,
         )
         # MAD mode with uniform S may or may not flag depending on distribution;
         # just verify it runs and returns the right shape/columns
@@ -438,6 +449,7 @@ class TestFlagAnomalies:
             label_col="ewoc_code",
             threshold_mode="absolute",
             abs_threshold=0.95,
+            require_absolute=False,
         )
         # Only the top 10 extreme values should be flagged
         assert flagged["flagged"].sum() >= 5
@@ -449,19 +461,25 @@ class TestFlagAnomalies:
             threshold_mode="percentile",
             percentile_q=0.80,
             max_flagged_fraction=0.05,
+            require_absolute=False,
         )
         frac = flagged["flagged"].mean()
         assert frac <= 0.05 + 1e-6
 
     def test_summary_has_expected_columns(self, scored_df):
-        _, summary = flag_anomalies(scored_df, label_col="ewoc_code")
+        _, summary = flag_anomalies(
+            scored_df, label_col="ewoc_code", require_absolute=False
+        )
         assert "total_samples" in summary.columns
         assert "flagged_samples" in summary.columns
         assert "flagged_fraction" in summary.columns
 
     def test_invalid_mode_raises(self, scored_df):
         with pytest.raises(ValueError, match="threshold_mode"):
-            flag_anomalies(scored_df, label_col="ewoc_code", threshold_mode="bogus")
+            flag_anomalies(
+                scored_df, label_col="ewoc_code", threshold_mode="bogus",
+                require_absolute=False,
+            )
 
 
 # ===================================================================
@@ -713,14 +731,27 @@ class TestMiniPipeline:
         for col in _SCORE_COLS:
             assert col in scored.columns
 
-        # Flag
+        # Calibrate to an absolute scale, then flag.  A single synthetic slice
+        # cannot support a cross-slice null, so the calibration degrades to the
+        # global fallback — which is exactly the behaviour we want to smoke-test.
         scored["h3_l3_cell"] = "cell_a"
         scored["ewoc_code"] = "cropland"
+        scored["scored"] = True
+        null_ref = compute_null_reference(
+            scored,
+            null_keys=["ewoc_code"],
+            slice_key_cols=["h3_l3_cell", "ewoc_code"],
+            scored_mask_col="scored",
+        )
+        scored = add_absolute_scores(scored, null_ref, null_keys=["ewoc_code"])
+        assert "abs_z" in scored.columns
+
         flagged, summary = flag_anomalies(
             scored,
             label_col="ewoc_code",
             threshold_mode="percentile",
             percentile_q=0.90,
+            require_absolute=False,
         )
         assert flagged["flagged"].sum() > 0
 

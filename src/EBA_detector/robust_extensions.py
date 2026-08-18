@@ -232,7 +232,11 @@ def downgrade_flags_low_trust(
     if flag_col not in df.columns or trust_col not in df.columns:
         return df
     trust = pd.to_numeric(df[trust_col], errors="coerce").fillna(0.5).to_numpy()
-    flags = df[flag_col].astype(object).to_numpy()
+    # copy=True is required: to_numpy() can hand back a view on the frame's
+    # own block, so the in-place downgrades below would write straight through
+    # into the caller's DataFrame (silently, on pandas < 3) or raise
+    # "assignment destination is read-only" (under pandas 3 copy-on-write).
+    flags = df[flag_col].astype(object).to_numpy(copy=True)
 
     cand = (flags == "candidate") & (trust < candidate_min_trust)
     flags[cand] = "suspect"
