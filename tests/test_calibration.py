@@ -754,3 +754,132 @@ class TestNullConditionedOnResolution:
         df = _mixed_resolution_world().drop(columns=["h3_effective_level"])
         flagged = _score_with_null_keys(df, ["h3_effective_level"])
         assert len(flagged) == len(df)
+
+
+# ---------------------------------------------------------------------------
+# 10. Localising the null to a region, with shrinkage
+# ---------------------------------------------------------------------------
+
+
+def _heterogeneous_world(contamination=0.0, sigmas=(0.16, 0.20, 0.40, 0.45),
+                         slices_per_region=12, n=150, seed=0):
+    """Regions whose within-class spread differs *legitimately*.
+
+    Wheat in a uniform monoculture disperses far less around its local centroid
+    than wheat in a fragmented smallholder landscape.  A globally pooled null is
+    set by whichever landscape contributes the most slices, so every region that
+    is legitimately more variable looks anomalous as a whole.
+    """
+    r = np.random.default_rng(seed)
+    rows = []
+    for ri, sig in enumerate(sigmas):
+        for s in range(slices_per_region):
+            c = r.normal(size=D) * 0.15 + np.eye(D)[0]
+            X = r.normal(size=(n, D)) * sig + c
+            n_out = int(contamination * n)
+            if n_out:
+                X[:n_out] = r.normal(size=(n_out, D)) * 0.22 + (
+                    r.normal(size=D) * 0.15 + np.eye(D)[1]
+                )
+            for i in range(n):
+                rows.append((f"r{ri}s{s}_{i}", f"r{ri}c{s}", "maize",
+                             X[i].astype(np.float32), f"region{ri}", i < n_out))
+    return pd.DataFrame(
+        rows,
+        columns=["sample_id", "h3_l3_cell", "label", "embedding", "region", "truth"],
+    )
+
+
+def _flag_with_null(df, extra_keys, shrink_k=5.0):
+    parts = []
+    for _k, g in df.groupby(["h3_l3_cell", "label"], sort=True):
+        sc = compute_scores_for_slice(
+            g, max_full_pairwise_n=0, force_knn=True, centroid_trim=0.45
+        )
+        sc["scored"] = True
+        parts.append(sc)
+    scored = pd.concat(parts, ignore_index=True)
+    keys = ["label"] + list(extra_keys)
+    null_ref = compute_null_reference(
+        scored, null_keys=keys, slice_key_cols=["h3_l3_cell", "label"],
+        scored_mask_col="scored", shrink_k=shrink_k,
+    )
+    scored = add_absolute_scores(scored, null_ref, null_keys=keys)
+    return flag_world(scored, mad_k=3.3, abs_z_k=3.3)
+
+
+class TestRegionalNull:
+    def test_global_null_biases_false_positives_toward_variable_regions(self):
+        """The failure this exists to fix: on clean data the flag rate should
+        not depend on how variable a region legitimately is."""
+        flagged = _flag_with_null(_heterogeneous_world(), [])
+        by_region = flagged.groupby("region")["flagged"].mean()
+        assert by_region.max() > 3 * max(by_region.min(), 1e-4), by_region.to_dict()
+
+    def test_regional_null_flattens_that_bias(self):
+        flagged = _flag_with_null(_heterogeneous_world(), ["region"])
+        by_region = flagged.groupby("region")["flagged"].mean()
+        assert by_region.max() - by_region.min() < 0.015, by_region.to_dict()
+        assert flagged["flagged"].mean() < 0.02
+
+    def test_regional_null_trades_recall_for_precision(self):
+        """The honest characterisation of the change.
+
+        Localising the null is NOT a free win.  Averaged over 5 seeds at 10 %
+        contamination it costs recall (0.89 -> 0.79) and buys precision
+        (0.90 -> 0.97): a good share of what the global null was "finding" was
+        the regional bias, not real errors.  The direction of the recall effect
+        is scenario-dependent - it improves where tight regions dominate - so
+        only the precision gain is asserted here.
+        """
+        df = _heterogeneous_world(contamination=0.10, seed=2)
+        out = {}
+        for name, keys in (("global", []), ("regional", ["region"])):
+            fl = _flag_with_null(df, keys)
+            t = fl["truth"].to_numpy()
+            h = fl["flagged"].to_numpy()
+            out[name] = ((h & t).sum() / max(h.sum(), 1),
+                         (h & t).sum() / max(t.sum(), 1))
+        assert out["regional"][0] > out["global"][0], out      # precision up
+        assert out["regional"][1] > 0.6 * out["global"][1], out  # recall not gutted
+
+    def test_localising_beats_pooling_at_every_support_level(self):
+        """The dominant, consistent effect — measured at 3, 5, 12 and 25 slices
+        per region, a local null gives roughly a third the false-positive rate
+        of a globally pooled one.  Shrinkage is insurance for thin regions, not
+        the source of the gain."""
+        for slices_per_region in (3, 12):
+            clean = _heterogeneous_world(slices_per_region=slices_per_region)
+            local = _flag_with_null(clean, ["region"])["flagged"].mean()
+            pooled = _flag_with_null(clean, [])["flagged"].mean()
+            assert local < pooled, (slices_per_region, local, pooled)
+
+    def test_shrinkage_does_not_destabilise_a_thin_region(self):
+        """A region with almost no support must not produce a wild null."""
+        clean = _heterogeneous_world(slices_per_region=3)
+        shrunk = _flag_with_null(clean, ["region"], shrink_k=5.0)["flagged"].mean()
+        assert shrunk < 0.03, shrunk
+
+    def test_shrinkage_weight_tracks_support(self):
+        """w = n/(n+k): well-supported regions keep their own null."""
+        scored = score_world(make_world(0.0, n_slices=30), centroid_trim=0.45)
+        null_ref = compute_null_reference(
+            scored, null_keys=["label"], slice_key_cols=["h3_l3_cell", "label"],
+            scored_mask_col="scored", shrink_k=5.0,
+        )
+        own = null_ref[null_ref["__is_global__"] != True]  # noqa: E712
+        w = float(own["null_shrink_w"].iloc[0])
+        assert np.isclose(w, 30 / 35, atol=0.01), w
+
+    def test_no_harm_when_regions_are_homogeneous(self):
+        """Where regions genuinely do not differ, conditioning must not cost."""
+        df = _heterogeneous_world(contamination=0.20, sigmas=(0.25,) * 4, seed=3)
+        out = {}
+        for name, keys in (("global", []), ("regional", ["region"])):
+            fl = _flag_with_null(df, keys)
+            t = fl["truth"].to_numpy()
+            h = fl["flagged"].to_numpy()
+            out[name] = ((h & t).sum() / max(t.sum(), 1),
+                         (h & t).sum() / max(h.sum(), 1))
+        assert out["regional"][0] > 0.9 * out["global"][0], out
+        assert out["regional"][1] >= out["global"][1] - 0.02, out

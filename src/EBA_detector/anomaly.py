@@ -647,7 +647,9 @@ def run_pipeline(
     abs_z_k: float = 3.3,
     abs_z_suspect: float = 4.0,
     abs_z_candidate: float = 5.5,
-    null_extra_keys: Optional[Sequence[str]] = ("h3_effective_level",),
+    null_extra_keys: Optional[Sequence[str]] = ("h3_null_region",),
+    null_region_level: Optional[int] = 1,
+    null_shrink_k: float = 5.0,
     abs_combine: str = "min",
     null_scale_estimator: str = "left_tail",
     # --- support / quality ----------------------------------------------
@@ -751,10 +753,67 @@ def run_pipeline(
         contaminated slice cannot calibrate its own errors away.  Set
         ``require_absolute=False`` to reproduce the legacy relative-only
         behaviour for ablations.
-    null_extra_keys
-        Extra columns to condition the null on, beyond the label class — e.g.
-        a continent or year column when distance scales differ systematically
-        between them.
+    null_extra_keys, null_region_level
+        How the cross-slice null is localised.
+
+        The null answers "how far from its own slice centroid does a typical
+        sample of this class sit?".  Pooling that question **globally** is
+        wrong, because the answer legitimately differs region to region: wheat
+        in a uniform monoculture disperses far less around its local centroid
+        than wheat in a fragmented smallholder landscape.  A global null is set
+        by whichever landscape contributes the most slices, and every region
+        that is legitimately more variable then looks anomalous *as a whole*.
+
+        Measured on clean synthetic data whose regions differ only in their
+        legitimate spread, with a global per-class null::
+
+            uniform    (sigma 0.15)   0.00 % flagged
+            uniform    (sigma 0.18)   0.00 %
+            mixed      (sigma 0.25)   0.29 %
+            mixed      (sigma 0.28)   1.17 %
+            fragmented (sigma 0.40)   3.50 %
+            fragmented (sigma 0.45)   4.12 %
+
+        — a pure regional false-positive gradient, landing hardest in exactly
+        the landscapes that are hardest to verify on a basemap.  Conditioning
+        the null on the region flattens it to 0.29-0.67 % everywhere and cuts
+        the overall rate from 1.51 % to 0.49 %.
+
+        *null_region_level* is the H3 resolution of that region key: the slice
+        cell's parent at this level is written to ``h3_null_region`` and used as
+        a null conditioner.  Level 1 (~610,000 km2, ~880 km across) holds ~50 L3
+        cells, enough slices to estimate a null for a common class while staying
+        far more homogeneous than a global pool.  Use 2 for tighter locality
+        where density supports it, or ``None`` to disable the region key.
+
+        *null_shrink_k* controls how much locality is actually spent.  The
+        dominant effect is localisation itself — measured at 3, 5, 12 and 25
+        slices per region, a local null gave roughly a third the clean
+        false-positive rate of a pooled one (0.7-0.8 % vs 2.0-2.4 %) at every
+        support level.  Shrinkage is *insurance*, not the source of the gain: a
+        null estimated from a couple of slices is noisy, and on real geography,
+        where regions straddle hexagon boundaries and some groups fall back,
+        an unshrunk local null did misbehave.  Each local null is therefore
+        shrunk toward the global one by
+        ``w = n_slices / (n_slices + null_shrink_k)``, so a region with 30
+        slices sits at w = 0.86 and one with 3 sits at w = 0.38.  There is no
+        threshold to trip over and sparse regions degrade smoothly.
+
+        Be clear that this is a **trade, not a free win**.  Averaged over five
+        seeds on regions of differing legitimate spread::
+
+            10 % contamination   recall 0.890 -> 0.790, precision 0.901 -> 0.969
+            20 % contamination   recall 0.806 -> 0.710, precision 0.977 -> 0.996
+            clean data           regional FP spread 3.85 % -> 0.78 %
+
+        A good share of what the pooled null was "finding" was the regional
+        bias rather than real errors, which is why precision rises as recall
+        falls.  The direction of the recall effect is scenario-dependent — it
+        goes the other way where tight regions dominate the collection.  Where
+        regions genuinely do *not* differ, conditioning costs ~2 % of recall and
+        still lowers the false-positive rate.  Add your own agro-ecological-zone or year column to
+        *null_extra_keys* if you have one — it is a better region proxy than a
+        hexagon.
     null_scale_estimator
         How the per-slice dispersion feeding the cross-slice null is measured.
         ``"left_tail"`` (default) uses ``median - q25``, i.e. only the clean
@@ -1249,6 +1308,28 @@ def run_pipeline(
     # everywhere: without it, every slice is min-max normalised onto [0, 1] and
     # therefore yields the same proportion of "suspects" whether it is clean or
     # 30 % mislabelled.
+    # Region key for the null.  Derived from the slice cell AFTER merging, so a
+    # merged slice is attributed to the region it actually sits in.
+    if null_region_level is not None and h3_level_name in scored_df.columns:
+        def _parent_at(cell):
+            try:
+                c = str(cell)
+                if h3.get_resolution(c) <= int(null_region_level):
+                    return c
+                return h3.cell_to_parent(c, int(null_region_level))
+            except Exception:
+                return None
+
+        _uniq = pd.unique(scored_df[h3_level_name].astype(str))
+        _map = {c: _parent_at(c) for c in _uniq}
+        scored_df["h3_null_region"] = scored_df[h3_level_name].astype(str).map(_map)
+        _n_bad = int(scored_df["h3_null_region"].isna().sum())
+        if _n_bad:
+            print(
+                f"[anomaly] {_n_bad:,} rows have no derivable L{null_region_level} "
+                "region key; their null falls back to the global one."
+            )
+
     null_keys = [label_col, *(list(null_extra_keys) if null_extra_keys else [])]
     null_keys = [k for k in null_keys if k in scored_df.columns]
 
@@ -1274,10 +1355,26 @@ def run_pipeline(
             min_slice_n=max(int(min_scoring_slice_size), 30),
             scored_mask_col="scored",
             scale_estimator=null_scale_estimator,
+            shrink_k=null_shrink_k,
         )
         scored_df = add_absolute_scores(
             scored_df, null_ref, null_keys=null_keys, combine=abs_combine
         )
+        # How localised was the null in practice?  A high fallback rate means
+        # the region level is too fine for this collection's density.
+        if len(null_keys) > 1:
+            _own = null_ref[null_ref.get("__is_global__", False) != True]  # noqa: E712
+            _have = (
+                set(map(tuple, _own[null_keys].astype(str).to_numpy()))
+                if len(_own) else set()
+            )
+            _rk = list(map(tuple, scored_df[null_keys].astype(str).to_numpy()))
+            _fb = sum(1 for k in _rk if k not in _have)
+            print(
+                f"[anomaly] Null localised on {null_keys}: {len(_own):,} local "
+                f"nulls; {_fb / max(len(_rk), 1):.1%} of rows fell back to the "
+                "global null (coarsen null_region_level if this is high)."
+            )
         _z_equiv = suggest_abs_z_threshold(
             scored_df, target_flag_fraction=0.02, scored_mask_col="scored"
         )

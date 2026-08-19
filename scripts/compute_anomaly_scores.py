@@ -303,8 +303,10 @@ class AnomalyRunConfig:
     # here too if you know distance scales differ across them.  The column is
     # silently ignored in fixed (non-adaptive) H3 mode, where it does not exist.
     null_extra_keys: Optional[List[str]] = field(
-        default_factory=lambda: ["h3_effective_level"]
+        default_factory=lambda: ["h3_null_region"]
     )
+    null_region_level: Optional[int] = 1
+    null_shrink_k: float = 5.0
     # --- support / quality ------------------------------------------------
     min_scoring_slice_size: int = 50
     quality_gate: bool = True
@@ -841,6 +843,8 @@ def run_single_domain_scoring(
             abs_combine=config.abs_combine,
             null_scale_estimator=config.null_scale_estimator,
             null_extra_keys=config.null_extra_keys,
+            null_region_level=config.null_region_level,
+            null_shrink_k=config.null_shrink_k,
             min_scoring_slice_size=config.min_scoring_slice_size,
             quality_gate=config.quality_gate,
             strict_quality=config.strict_quality,
@@ -1986,12 +1990,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
                       help=("How to combine the centroid-distance and kNN-distance "
                             "z-scores. 'min' (default) demands both."))
     absg.add_argument(
-        "--null-extra-keys", type=str, nargs="*", default=["h3_effective_level"],
+        "--null-extra-keys", type=str, nargs="*", default=["h3_null_region"],
         help=("Extra columns conditioning the cross-slice null beyond the "
               "label class (e.g. a continent or year column). Use when "
               "legitimate distance scales differ systematically between "
               "regions/periods, otherwise heterogeneous regions inherit a "
               "false-positive bias from the pooled null."))
+    absg.add_argument("--null-region-level", type=int, default=1,
+                      help=("H3 resolution of the region key the cross-slice null "
+                            "is conditioned on (L1 ~610,000 km2). A class's "
+                            "legitimate dispersion differs region to region, so a "
+                            "globally pooled null makes more-variable landscapes "
+                            "look anomalous as a whole. Use -1 to disable."))
+    absg.add_argument("--null-shrink-k", type=float, default=5.0,
+                      help=("Shrinkage of each regional null toward the global one: "
+                            "w = n_slices/(n_slices+k). A hard local null is noisy "
+                            "and measurably worse than pooling; this spends locality "
+                            "in proportion to the evidence for it."))
     absg.add_argument("--purity-veto", type=float, default=0.80,
                       help=("Cap escalation at 'flagged' when this fraction of a "
                             "point's neighbours share its label. Set 1.1 to disable."))
@@ -2116,6 +2131,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         abs_combine=args.abs_combine,
         null_scale_estimator=args.null_scale_estimator,
         null_extra_keys=list(args.null_extra_keys) if args.null_extra_keys else [],
+        null_region_level=(None if args.null_region_level is not None
+                           and args.null_region_level < 0 else args.null_region_level),
+        null_shrink_k=args.null_shrink_k,
         purity_veto=args.purity_veto,
         min_scoring_slice_size=args.min_scoring_slice_size,
         quality_gate=not bool(args.no_quality_gate),
