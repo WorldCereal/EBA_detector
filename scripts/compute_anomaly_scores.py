@@ -248,6 +248,11 @@ class AnomalyRunConfig:
     max_full_pairwise_n: int = 0
     norm_percentiles: Tuple[float, float] = (2.0, 98.0)
     skip_classes: Optional[List[str]] = field(default_factory=lambda: ["ignore"])
+    centroid_mode: str = "trimmed"
+    centroid_trim: float = 0.05
+    gate_confidence_by_flag: bool = True
+    apply_slice_trust: bool = False
+    slice_trust_min: float = 0.05
     # Final output column names
     confidence_col_name: str = "confidence_nonoutlier"
     anomaly_flag_col_name: str = "anomaly_flag"
@@ -783,6 +788,11 @@ def run_single_domain_scoring(
             max_flagged_fraction=None,
             max_full_pairwise_n=config.max_full_pairwise_n,
             norm_percentiles=config.norm_percentiles,
+            centroid_mode=config.centroid_mode,
+            centroid_trim=config.centroid_trim,
+            gate_confidence_by_flag=config.gate_confidence_by_flag,
+            apply_slice_trust=config.apply_slice_trust,
+            slice_trust_min=config.slice_trust_min,
             output_samples_path=output_samples_path,
             output_summary_path=output_summary_path,
             write_outputs=write_outputs,
@@ -821,19 +831,157 @@ def merge_lc10_cty24_scores(
     cty24_df: pd.DataFrame,
     merged_scores_path: Path,
     overwrite: bool = False,
+    post_processing_skip_classes: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """Outer-join LC10 and CTY24 scored DataFrames on (ref_id, sample_id)."""
+    """Outer-join LC10 and CTY24 scored DataFrames on (ref_id, sample_id).
+
+    On a fresh merge (output missing or ``overwrite=True``), also applies
+    post-processing (skip-class fill + LC10→CTY24 escalation, see
+    ``apply_score_postprocessing``) before writing to disk — so the cached
+    read-back branch always returns already-post-processed scores and
+    post-processing never runs twice on the same rows.
+    """
     if merged_scores_path.exists() and not overwrite:
         logger.info(f"skip merge — reading existing: {merged_scores_path}")
         return pd.read_parquet(str(merged_scores_path))
 
     merged = cty24_df.merge(lc10_df, on=["ref_id", "sample_id"], how="outer")
+    merged = apply_score_postprocessing(merged, post_processing_skip_classes)
     merged.sort_values(["ref_id", "sample_id"], inplace=True)
     merged.reset_index(drop=True, inplace=True)
     merged_scores_path.parent.mkdir(parents=True, exist_ok=True)
     merged.to_parquet(str(merged_scores_path), index=False)
     logger.info(f"merged scores: {len(merged):,} rows → {merged_scores_path}")
     return merged
+
+
+# ===========================================================================
+# Step 8b – Post-processing: skip-class fill + LC10→CTY24 escalation
+# ===========================================================================
+#
+# Ported from notebooks/compute_outlier_scores.ipynb (cell 31). Two adjustments
+# applied to merged scores AFTER scoring, BEFORE any write-back:
+#
+#   1. Skip-class fill: samples held aside by run_pipeline (e.g. "ignore")
+#      come back with NaN in all anomaly columns. They are definitively not
+#      outliers, so fill confidence=1.0 / flag="normal" for both domains.
+#   2. Post-processing skip classes: samples whose *scored* class is in
+#      post_processing_skip_classes get the same 1.0/"normal" reset, applied
+#      independently per domain, after the fact (no re-scoring needed).
+#   3. LC10 → CTY24 escalation: when LC10 == "temporary_crops" and its flag
+#      is strictly higher than CTY24's (and CTY24 isn't already "normal"),
+#      raise CTY24 by one level (capped at LC10's level) and average the two
+#      domains' confidence for the escalated rows. Flows parent → sub-crop
+#      only, never the reverse, and never promotes a "normal" CTY24 result.
+
+_FLAG_ORDER = ["normal", "flagged", "suspect", "candidate"]
+_FLAG_RANK = {f: i for i, f in enumerate(_FLAG_ORDER)}
+
+
+def _fill_skip_class_scores(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill NaN anomaly values (skip-class rows) with confidence=1.0 / flag='normal'."""
+    df = df.copy()
+    for prefix in ("LC10", "CTY24"):
+        conf_col = f"{prefix}_confidence_nonoutlier"
+        flag_col = f"{prefix}_anomaly_flag"
+        if conf_col in df.columns:
+            df[conf_col] = df[conf_col].fillna(1.0).astype("float32")
+        if flag_col in df.columns:
+            df[flag_col] = df[flag_col].fillna("normal")
+    return df
+
+
+def _apply_postprocessing_skip_classes(
+    df: pd.DataFrame,
+    skip_classes: List[str],
+) -> pd.DataFrame:
+    """Reset scores to 1.0 / 'normal' for samples whose scored class is in skip_classes."""
+    if not skip_classes:
+        return df
+
+    df = df.copy()
+    skip_set = {str(c).lower().strip() for c in skip_classes}
+
+    domain_map = {
+        "LC10": ("outlier_LC10_cls", "LC10_confidence_nonoutlier", "LC10_anomaly_flag"),
+        "CTY24": ("outlier_CTY24_cls", "CTY24_confidence_nonoutlier", "CTY24_anomaly_flag"),
+    }
+
+    for domain, (cls_col, conf_col, flag_col) in domain_map.items():
+        if cls_col not in df.columns:
+            continue
+        mask = df[cls_col].astype(str).str.lower().str.strip().isin(skip_set)
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        if conf_col in df.columns:
+            df.loc[mask, conf_col] = float(1.0)
+            df[conf_col] = df[conf_col].astype("float32")
+        if flag_col in df.columns:
+            df.loc[mask, flag_col] = "normal"
+        logger.info(f"[post-skip/{domain}] Reset {n:,} rows matching classes: {skip_classes}")
+
+    return df
+
+
+def _apply_lc10_to_cty24_escalation(df: pd.DataFrame) -> pd.DataFrame:
+    """Escalate CTY24 anomaly flag when LC10=temporary_crops is scored higher."""
+    df = df.copy()
+
+    lc10_cls_col = "outlier_LC10_cls"
+    lc10_flag_col = "LC10_anomaly_flag"
+    lc10_conf_col = "LC10_confidence_nonoutlier"
+    cty24_flag_col = "CTY24_anomaly_flag"
+    cty24_conf_col = "CTY24_confidence_nonoutlier"
+
+    required = [lc10_cls_col, lc10_flag_col, lc10_conf_col, cty24_flag_col, cty24_conf_col]
+    if not all(c in df.columns for c in required):
+        logger.info("[escalation] Missing required columns — skipping LC10→CTY24 escalation.")
+        return df
+
+    lc10_rank = df[lc10_flag_col].map(_FLAG_RANK).fillna(0).astype(int)
+    cty24_rank = df[cty24_flag_col].map(_FLAG_RANK).fillna(0).astype(int)
+
+    esc_mask = (
+        (df[lc10_cls_col].astype(str).str.lower() == "temporary_crops")
+        & (cty24_rank > 0)
+        & (lc10_rank > cty24_rank)
+    )
+
+    n_esc = int(esc_mask.sum())
+    logger.info(f"[escalation] {n_esc:,} samples eligible for LC10→CTY24 escalation.")
+    if n_esc == 0:
+        return df
+
+    new_cty24_rank = (cty24_rank + 1).clip(upper=lc10_rank)
+    df.loc[esc_mask, cty24_flag_col] = new_cty24_rank[esc_mask].map(lambda r: _FLAG_ORDER[int(r)])
+
+    avg_conf = (
+        df.loc[esc_mask, lc10_conf_col].astype(float)
+        + df.loc[esc_mask, cty24_conf_col].astype(float)
+    ) / 2.0
+    df.loc[esc_mask, cty24_conf_col] = avg_conf.clip(0.0, 1.0).astype("float32")
+
+    return df
+
+
+def apply_score_postprocessing(
+    df: pd.DataFrame,
+    post_processing_skip_classes: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """Apply the full post-processing chain: skip-class fill → post-skip reset → escalation.
+
+    Matches notebooks/compute_outlier_scores.ipynb cell 31 exactly. No-op on
+    an empty DataFrame.
+    """
+    if df.empty:
+        return df
+    df = _fill_skip_class_scores(df)
+    if post_processing_skip_classes:
+        df = _apply_postprocessing_skip_classes(df, post_processing_skip_classes)
+    df = _apply_lc10_to_cty24_escalation(df)
+    logger.info(f"[post-processing] complete — {len(df):,} rows.")
+    return df
 
 
 # ===========================================================================
@@ -987,10 +1135,16 @@ def write_scores_to_wide_parquet(
     src_schema = src_pf.schema_arrow
     logger.info(f"wide source: {src_pf.metadata.num_rows:,} rows, {len(src_schema)} cols")
 
+    # base_fields always excludes anomaly_cols (below), so extra_fields must
+    # always (re-)add every one of them — even when the source already has
+    # them (e.g. stale NaN-stub columns from an earlier partial run). Only
+    # skipping already-present columns here silently drops them from the
+    # schema entirely instead of overwriting with fresh values. Always derive
+    # the dtype from scores_lookup (the fresh values being written), not from
+    # a stale source column, which may have been typed differently (e.g. an
+    # all-NaN stub column written as double instead of float32).
     extra_fields: list[pa.Field] = []
     for col in anomaly_cols:
-        if col in src_schema.names:
-            continue
         dtype = scores_lookup[col].dtype
         arrow_type = pa.float32() if str(dtype).startswith("float") else pa.string()
         extra_fields.append(pa.field(col, arrow_type))
@@ -1043,6 +1197,7 @@ def _run_scoring_rerun(
     write_review_parquets: bool,
     restrict_model_hash: Optional[str],
     debug: bool,
+    post_processing_skip_classes: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """Run both pipelines over the full DuckDB cache and return merged scores."""
     logger.info("[rerun] Running LANDCOVER10 scoring (full cache) ...")
@@ -1076,6 +1231,7 @@ def _run_scoring_rerun(
         cty24_df=cty24_df,
         merged_scores_path=merged_scores_path,
         overwrite=overwrite_merged_scores,
+        post_processing_skip_classes=post_processing_skip_classes,
     )
 
 
@@ -1233,6 +1389,7 @@ def _run_scoring_update(
     restrict_model_hash: Optional[str],
     debug: bool,
     parquet_glob: str = "**/*.parquet",
+    post_processing_skip_classes: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, set]:
     """Incrementally re-score only geographic slices affected by new data.
 
@@ -1358,6 +1515,8 @@ def _run_scoring_update(
     else:
         merged = cty24_df.merge(lc10_df, on=["ref_id", "sample_id"], how="outer")
 
+    merged = apply_score_postprocessing(merged, post_processing_skip_classes)
+
     logger.info(f"[update] Merged scores: {len(merged):,} rows "
                 f"(LC10: {len(lc10_df):,}, CTY24: {len(cty24_df):,})")
     return merged, all_rescored_ref_ids
@@ -1404,6 +1563,9 @@ def compute_anomaly_scores(
     skip_scoring: bool,
     skip_write_back: bool,
     compute: Optional[List[str]] = None,
+    post_processing_skip_classes: Optional[List[str]] = None,
+    skip_long_write_back: bool = False,
+    skip_wide_write_back: bool = False,
 ) -> None:
     """Run the full anomaly scoring pipeline end to end.
 
@@ -1567,6 +1729,7 @@ def compute_anomaly_scores(
                 write_review_parquets=True,
                 restrict_model_hash=None,
                 debug=False,
+                post_processing_skip_classes=post_processing_skip_classes,
             )
             # rescored_ref_ids stays None → write_scores_to_long_parquets rewrites all
 
@@ -1623,6 +1786,7 @@ def compute_anomaly_scores(
                 restrict_model_hash=None,
                 debug=False,
                 parquet_glob=parquet_glob,
+                post_processing_skip_classes=post_processing_skip_classes,
             )
             if merged_scores.empty:
                 logger.info("No re-scoring needed — all parquets are already up to date.")
@@ -1641,35 +1805,58 @@ def compute_anomaly_scores(
     # ------------------------------------------------------------------
     # Step 9 – Write back to long parquets
     # ------------------------------------------------------------------
-    logger.info("[9/10] Writing scores to long-format parquets ...")
-    n_written = write_scores_to_long_parquets(
-        merged_scores=merged_scores,
-        input_long_dir=input_long_dir,
-        output_long_dir=effective_output_long,
-        anomaly_cols=anomaly_cols,
-        parquet_glob=parquet_glob,
-        only_affected_ref_ids=rescored_ref_ids,  # None = write all; set = write only affected
-    )
-    logger.info(f"  wrote {n_written} files → {effective_output_long}")
+    # Independently skippable: the long-format parquets aren't always all
+    # present in input_long_dir (unlike the wide/merged parquet in step 10,
+    # which is always available), so this step can be turned off on its own
+    # via --skip-long-write-back without disabling step 10.
+    if skip_long_write_back:
+        logger.info("[9/10] Skipping long-parquet write-back (--skip-long-write-back)")
+    else:
+        logger.info("[9/10] Writing scores to long-format parquets ...")
+        n_written = write_scores_to_long_parquets(
+            merged_scores=merged_scores,
+            input_long_dir=input_long_dir,
+            output_long_dir=effective_output_long,
+            anomaly_cols=anomaly_cols,
+            parquet_glob=parquet_glob,
+            only_affected_ref_ids=rescored_ref_ids,  # None = write all; set = write only affected
+        )
+        logger.info(f"  wrote {n_written} files → {effective_output_long}")
 
     # ------------------------------------------------------------------
     # Step 10 – Write back to merged wide parquet
     # ------------------------------------------------------------------
-    logger.info("[10/10] Writing scores to merged wide parquet ...")
-    if not effective_merged_wide.exists():
-        logger.warning(
-            f"Merged wide parquet not found ({effective_merged_wide}); skipping wide write-back."
-        )
+    if skip_wide_write_back:
+        logger.info("[10/10] Skipping wide-parquet write-back (--skip-wide-write-back)")
     else:
-        write_scores_to_wide_parquet(
-            merged_scores=merged_scores,
-            src_wide_path=effective_merged_wide,
-            output_wide_path=effective_output_wide,
-            anomaly_cols=anomaly_cols,
-            batch_rows=merge_cfg.batch_rows,
-            row_group_size=merge_cfg.row_group_size,
-            overwrite=overwrite_wide_scores,
-        )
+        logger.info("[10/10] Writing scores to merged wide parquet ...")
+        if not effective_merged_wide.exists():
+            if skip_long_write_back:
+                # Both write-back paths are now inactive: long was explicitly
+                # skipped, and wide has nowhere to write either. Silently
+                # warning here means the whole pipeline computes scores and
+                # then discards them with exit code 0 — fail loudly instead.
+                raise FileNotFoundError(
+                    f"Merged wide parquet not found ({effective_merged_wide}) and "
+                    "--skip-long-write-back is set, so there is no remaining "
+                    "write-back path — scores were computed but would not be "
+                    "written anywhere. Pass --merged-wide-path / set "
+                    "MERGED_WIDE_PATH to the correct file, or drop "
+                    "--skip-long-write-back."
+                )
+            logger.warning(
+                f"Merged wide parquet not found ({effective_merged_wide}); skipping wide write-back."
+            )
+        else:
+            write_scores_to_wide_parquet(
+                merged_scores=merged_scores,
+                src_wide_path=effective_merged_wide,
+                output_wide_path=effective_output_wide,
+                anomaly_cols=anomaly_cols,
+                batch_rows=merge_cfg.batch_rows,
+                row_group_size=merge_cfg.row_group_size,
+                overwrite=overwrite_wide_scores,
+            )
 
     logger.info("Pipeline complete.")
 
@@ -1850,7 +2037,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         metavar=("LO", "HI"))
     common.add_argument("--fdr-alpha",           type=float, default=0.05)
     common.add_argument("--skip-classes",        type=str, nargs="+", default=["ignore"])
+    common.add_argument(
+        "--post-processing-skip-classes", type=str, nargs="+", default=["ignore", "trees"],
+        help=(
+            "Applied AFTER scoring (independent of --skip-classes, which excludes "
+            "samples from scoring entirely): any row whose scored LC10 or CTY24 "
+            "class is in this list has its confidence/flag reset to 1.0/'normal' "
+            "post-hoc. Matches the notebook's POST_PROCESSING_SKIP_CLASSES. "
+            "Pass an empty value to disable."
+        ),
+    )
     common.add_argument("--max-full-pairwise-n", type=int, default=0)
+    common.add_argument("--centroid-mode",       type=str, default="trimmed",
+                        help="Slice-centroid estimator, e.g. 'trimmed' or 'mean'.")
+    common.add_argument("--centroid-trim",       type=float, default=0.05,
+                        help="Trim fraction used when --centroid-mode=trimmed.")
+    common.add_argument("--gate-confidence-by-flag", action=argparse.BooleanOptionalAction, default=True,
+                        help="Zero out confidence_nonoutlier for flagged points (matches notebook default).")
+    common.add_argument("--apply-slice-trust",   action=argparse.BooleanOptionalAction, default=False,
+                        help="Down-weight low-trust slices when scoring.")
+    common.add_argument("--slice-trust-min",     type=float, default=0.05,
+                        help="Minimum slice-trust value used when --apply-slice-trust is set.")
 
     # Update-specific
     upd = p.add_argument_group("update mode")
@@ -1884,7 +2091,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     sk.add_argument(
         "--skip-write-back", action="store_true",
-        help="Skip steps 9–10 (writing scores back to long/wide parquets).",
+        help="Skip both steps 9 and 10 (writing scores back to long AND wide parquets).",
+    )
+    sk.add_argument(
+        "--skip-long-write-back", action="store_true",
+        help=(
+            "Skip step 9 only (writing scores back to long-format parquets). "
+            "Useful when input_long_dir doesn't reliably contain every long "
+            "parquet file — step 10 (wide/merged parquet) still runs."
+        ),
+    )
+    sk.add_argument(
+        "--skip-wide-write-back", action="store_true",
+        help="Skip step 10 only (writing scores back to the merged wide parquet).",
     )
 
     # One-off recomputations
@@ -1955,6 +2174,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         norm_percentiles=tuple(args.norm_percentiles),
         skip_classes=args.skip_classes,
         max_full_pairwise_n=args.max_full_pairwise_n,
+        centroid_mode=args.centroid_mode,
+        centroid_trim=args.centroid_trim,
+        gate_confidence_by_flag=bool(args.gate_confidence_by_flag),
+        apply_slice_trust=bool(args.apply_slice_trust),
+        slice_trust_min=args.slice_trust_min,
     )
     lc10_config = AnomalyRunConfig(
         label_domain=args.lc10_class_mapping,
@@ -2011,7 +2235,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         skip_embeddings=bool(args.skip_embeddings),
         skip_scoring=bool(args.skip_scoring),
         skip_write_back=bool(args.skip_write_back),
+        skip_long_write_back=bool(args.skip_long_write_back),
+        skip_wide_write_back=bool(args.skip_wide_write_back),
         compute=args.compute_h3_levels,
+        post_processing_skip_classes=args.post_processing_skip_classes,
     )
     return 0
 
