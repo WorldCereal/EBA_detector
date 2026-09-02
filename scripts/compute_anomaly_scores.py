@@ -159,6 +159,7 @@ _ensure_worldcereal_importable = _ensure_packages_importable
 _ensure_packages_importable()
 
 import duckdb  # noqa: E402
+import geopandas as gpd  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import pyarrow as pa  # noqa: E402
@@ -323,6 +324,15 @@ class AnomalyRunConfig:
     quality_gate: bool = True
     strict_quality: bool = False
     purity_veto: float = 0.80
+    # --- centroid / confidence shaping -------------------------------------
+    centroid_mode: str = "trimmed"
+    # NOTE: 0.45 (not main branch's 0.05) — centroid_trim now also has to resist
+    # the heavy per-class slice contamination this branch targets; see
+    # null_scale_estimator's docstring in anomaly.py for the measured effect.
+    centroid_trim: float = 0.45
+    gate_confidence_by_flag: bool = True
+    apply_slice_trust: bool = False
+    slice_trust_min: float = 0.05
     # Final output column names
     confidence_col_name: str = "confidence_nonoutlier"
     anomaly_flag_col_name: str = "anomaly_flag"
@@ -398,6 +408,48 @@ def discover_parquets(input_dir: Path, pattern: str = "**/*.parquet") -> list[Pa
 
 def _wide_out_path(wide_dir: Path, raw_path: Path, suffix: str = "_ppq") -> Path:
     return wide_dir / f"{raw_path.stem}{suffix}.parquet"
+
+
+def collect_wide_files_for_merge(
+    wide_dir: Path,
+    produced: Sequence[Path],
+    *,
+    rescan: bool = True,
+    suffix: str = "_ppq",
+) -> list[Path]:
+    """The file list step 3 merges: the freshly-produced wide parquets plus,
+    when ``rescan`` is set, everything else already sitting in ``wide_dir``.
+
+    ``long_to_wide_parquets`` only ever returns one entry per *input* long
+    parquet, so on its own it silently excludes wide files that have no
+    counterpart in ``input_long_dir`` — e.g. datasets copied in from an
+    earlier run's wide directory, whose long-format source was never staged
+    here. Those are exactly the files a backfill is meant to bring in, and
+    dropping them from the merge means their samples never reach the merged
+    wide parquet, so the wide write-back has no row to attach their scores
+    to (it left-joins scores onto the merged parquet and never adds rows).
+
+    Rescanning matches the notebooks, which rebuild the list immediately
+    before merging (``wide_files = sorted(WIDE_DIR.glob("*.parquet"))``)
+    rather than reusing the per-input list built during process_parquet.
+
+    The glob is suffix-anchored (``*_ppq.parquet``) so unrelated parquets
+    that happen to share the directory are not swept into the merge.
+    """
+    files = {p for p in produced if p.exists()}
+    if rescan and wide_dir.exists():
+        extra = {p for p in wide_dir.glob(f"*{suffix}.parquet")} - files
+        if extra:
+            logger.info(
+                f"  rescan of {wide_dir} found {len(extra)} wide parquet(s) with no "
+                f"long-format counterpart in the input dir — including them in the merge"
+            )
+            for e in sorted(extra)[:10]:
+                logger.info(f"    + {e.name}")
+            if len(extra) > 10:
+                logger.info(f"    ... and {len(extra) - 10} more")
+        files |= extra
+    return sorted(files)
 
 
 def long_to_wide_parquets(
@@ -875,6 +927,11 @@ def run_single_domain_scoring(
             max_flagged_fraction=None,
             max_full_pairwise_n=config.max_full_pairwise_n,
             norm_percentiles=config.norm_percentiles,
+            centroid_mode=config.centroid_mode,
+            centroid_trim=config.centroid_trim,
+            gate_confidence_by_flag=config.gate_confidence_by_flag,
+            apply_slice_trust=config.apply_slice_trust,
+            slice_trust_min=config.slice_trust_min,
             output_samples_path=output_samples_path,
             output_summary_path=output_summary_path,
             write_outputs=write_outputs,
@@ -913,19 +970,292 @@ def merge_lc10_cty24_scores(
     cty24_df: pd.DataFrame,
     merged_scores_path: Path,
     overwrite: bool = False,
+    post_processing_skip_classes: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """Outer-join LC10 and CTY24 scored DataFrames on (ref_id, sample_id)."""
+    """Outer-join LC10 and CTY24 scored DataFrames on (ref_id, sample_id).
+
+    On a fresh merge (output missing or ``overwrite=True``), also applies
+    post-processing (skip-class fill + LC10→CTY24 escalation, see
+    ``apply_score_postprocessing``) before writing to disk — so the cached
+    read-back branch always returns already-post-processed scores and
+    post-processing never runs twice on the same rows.
+    """
     if merged_scores_path.exists() and not overwrite:
         logger.info(f"skip merge — reading existing: {merged_scores_path}")
         return pd.read_parquet(str(merged_scores_path))
 
     merged = cty24_df.merge(lc10_df, on=["ref_id", "sample_id"], how="outer")
+    merged = apply_score_postprocessing(merged, post_processing_skip_classes)
     merged.sort_values(["ref_id", "sample_id"], inplace=True)
     merged.reset_index(drop=True, inplace=True)
     merged_scores_path.parent.mkdir(parents=True, exist_ok=True)
     merged.to_parquet(str(merged_scores_path), index=False)
     logger.info(f"merged scores: {len(merged):,} rows → {merged_scores_path}")
     return merged
+
+
+# ===========================================================================
+# Step 8b – Post-processing: skip-class fill + LC10→CTY24 escalation
+# ===========================================================================
+#
+# Ported from notebooks/compute_outlier_scores.ipynb (cell 32 on this branch).
+# Two adjustments applied to merged scores AFTER scoring, BEFORE any write-back:
+#
+#   1. Skip-class fill: samples held aside by run_pipeline (e.g. "ignore")
+#      come back with NaN in all anomaly columns under legacy outputs, or the
+#      explicit terminal state "skipped" under current ones. NaN cases are
+#      filled to confidence=1.0 / flag="normal"; "skipped" (and the other
+#      terminal states) are deliberately left alone — see _NON_JUDGED_FLAGS.
+#   2. Post-processing skip classes: samples whose *scored* class is in
+#      post_processing_skip_classes get the same 1.0/"normal" reset, applied
+#      independently per domain, after the fact (no re-scoring needed).
+#   3. LC10 → CTY24 escalation: when LC10 == "temporary_crops" and its flag
+#      is strictly higher than CTY24's (and CTY24 isn't already "normal"),
+#      raise CTY24 by one level (capped at LC10's level) and average the two
+#      domains' confidence for the escalated rows. Flows parent → sub-crop
+#      only, never the reverse, and never promotes a "normal" CTY24 result.
+#      Rows where either domain never reached a verdict (unscored / unscorable
+#      / unmapped / skipped) are excluded from escalation outright — you
+#      cannot raise a verdict that was never made.
+
+_FLAG_ORDER = ["normal", "flagged", "suspect", "candidate"]
+_FLAG_RANK = {f: i for i, f in enumerate(_FLAG_ORDER)}
+
+# Terminal states that are NOT rungs on the severity ladder. The detector could
+# not form an opinion (slice too small / embedding rejected / ewoc_code absent
+# from the legend) or was told to skip the row. These must never be folded
+# into "normal" — that conflation ("we did not look" silently reading as "we
+# looked and it is fine") is exactly what these states exist to prevent — and
+# are excluded from escalation: you cannot raise a verdict that was never made.
+_NON_JUDGED_FLAGS = {"unscored", "unscorable", "unmapped", "skipped"}
+
+
+def _is_judged(flag_series: pd.Series) -> pd.Series:
+    """True where the detector actually reached a verdict."""
+    return ~flag_series.astype(str).isin(_NON_JUDGED_FLAGS)
+
+
+def _fill_skip_class_scores(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill NaN anomaly values (legacy skip-class rows) with confidence=1.0 / flag='normal'.
+
+    Skip-class samples held out of scoring by run_pipeline now come back with
+    the explicit terminal state "skipped" rather than NaN, so this is a safety
+    net for older outputs only. Deliberately does not touch "skipped" (or any
+    other non-judged state): fillna only replaces actual NaNs, and terminal
+    states are non-null strings, so they pass through unchanged.
+    """
+    df = df.copy()
+    for prefix in ("LC10", "CTY24"):
+        conf_col = f"{prefix}_confidence_nonoutlier"
+        flag_col = f"{prefix}_anomaly_flag"
+        if conf_col in df.columns:
+            df[conf_col] = df[conf_col].fillna(1.0).astype("float32")
+        if flag_col in df.columns:
+            df[flag_col] = df[flag_col].fillna("normal")
+    return df
+
+
+def _apply_postprocessing_skip_classes(
+    df: pd.DataFrame,
+    skip_classes: List[str],
+) -> pd.DataFrame:
+    """Reset scores to 1.0 / 'normal' for samples whose scored class is in skip_classes."""
+    if not skip_classes:
+        return df
+
+    df = df.copy()
+    skip_set = {str(c).lower().strip() for c in skip_classes}
+
+    domain_map = {
+        "LC10": ("outlier_LC10_cls", "LC10_confidence_nonoutlier", "LC10_anomaly_flag"),
+        "CTY24": ("outlier_CTY24_cls", "CTY24_confidence_nonoutlier", "CTY24_anomaly_flag"),
+    }
+
+    for domain, (cls_col, conf_col, flag_col) in domain_map.items():
+        if cls_col not in df.columns:
+            continue
+        mask = df[cls_col].astype(str).str.lower().str.strip().isin(skip_set)
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        if conf_col in df.columns:
+            df.loc[mask, conf_col] = float(1.0)
+            df[conf_col] = df[conf_col].astype("float32")
+        if flag_col in df.columns:
+            df.loc[mask, flag_col] = "normal"
+        logger.info(f"[post-skip/{domain}] Reset {n:,} rows matching classes: {skip_classes}")
+
+    return df
+
+
+def _apply_lc10_to_cty24_escalation(df: pd.DataFrame) -> pd.DataFrame:
+    """Escalate CTY24 anomaly flag when LC10=temporary_crops is scored higher."""
+    df = df.copy()
+
+    lc10_cls_col = "outlier_LC10_cls"
+    lc10_flag_col = "LC10_anomaly_flag"
+    lc10_conf_col = "LC10_confidence_nonoutlier"
+    cty24_flag_col = "CTY24_anomaly_flag"
+    cty24_conf_col = "CTY24_confidence_nonoutlier"
+
+    required = [lc10_cls_col, lc10_flag_col, lc10_conf_col, cty24_flag_col, cty24_conf_col]
+    if not all(c in df.columns for c in required):
+        logger.info("[escalation] Missing required columns — skipping LC10→CTY24 escalation.")
+        return df
+
+    lc10_rank = df[lc10_flag_col].map(_FLAG_RANK).fillna(0).astype(int)
+    cty24_rank = df[cty24_flag_col].map(_FLAG_RANK).fillna(0).astype(int)
+
+    # Rows where either domain never reached a verdict are excluded outright.
+    # Without this they map to rank 0 and are silently treated as "normal".
+    judged = _is_judged(df[lc10_flag_col]) & _is_judged(df[cty24_flag_col])
+
+    esc_mask = (
+        judged
+        & (df[lc10_cls_col].astype(str).str.lower() == "temporary_crops")
+        & (cty24_rank > 0)
+        & (lc10_rank > cty24_rank)
+    )
+
+    n_esc = int(esc_mask.sum())
+    logger.info(f"[escalation] {n_esc:,} samples eligible for LC10→CTY24 escalation.")
+    if n_esc == 0:
+        return df
+
+    new_cty24_rank = (cty24_rank + 1).clip(upper=lc10_rank)
+    df.loc[esc_mask, cty24_flag_col] = new_cty24_rank[esc_mask].map(lambda r: _FLAG_ORDER[int(r)])
+
+    avg_conf = (
+        df.loc[esc_mask, lc10_conf_col].astype(float)
+        + df.loc[esc_mask, cty24_conf_col].astype(float)
+    ) / 2.0
+    df.loc[esc_mask, cty24_conf_col] = avg_conf.clip(0.0, 1.0).astype("float32")
+
+    return df
+
+
+def apply_score_postprocessing(
+    df: pd.DataFrame,
+    post_processing_skip_classes: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """Apply the full post-processing chain: skip-class fill → post-skip reset → escalation.
+
+    Matches notebooks/compute_outlier_scores.ipynb cell 32 on this branch,
+    including the non-judged-flag guard on escalation. No-op on an empty
+    DataFrame.
+    """
+    if df.empty:
+        return df
+    df = _fill_skip_class_scores(df)
+    if post_processing_skip_classes:
+        df = _apply_postprocessing_skip_classes(df, post_processing_skip_classes)
+    df = _apply_lc10_to_cty24_escalation(df)
+    logger.info(f"[post-processing] complete — {len(df):,} rows.")
+
+    # Coverage report: how much of the collection the detector could actually
+    # judge. A large non-judged share is a finding in its own right (sparse
+    # regions, encoder failures, legend gaps).
+    for prefix in ("LC10", "CTY24"):
+        flag_col = f"{prefix}_anomaly_flag"
+        if flag_col in df.columns:
+            nj = df[flag_col].astype(str).isin(_NON_JUDGED_FLAGS)
+            if nj.any():
+                logger.info(
+                    f"[{prefix}] not judged: {int(nj.sum()):,} / {len(df):,} "
+                    f"({nj.mean():.2%}) — {df.loc[nj, flag_col].value_counts().to_dict()}"
+                )
+    return df
+
+
+# ===========================================================================
+# Step 8c – GeoParquet export of merged scores (for QGIS viewing)
+# ===========================================================================
+
+
+def export_merged_scores_geoparquet(
+    merged_scores: pd.DataFrame,
+    merged_scores_path: Path,
+    src_wide_path: Path,
+) -> Optional[Path]:
+    """Write a GeoParquet sibling of the merged-scores df parquet, for QGIS.
+
+    ``merged_scores`` (and the file at ``merged_scores_path``) has no lat/lon
+    — it's a plain outer-join of the LC10/CTY24 scoring outputs on
+    (ref_id, sample_id), and stays that way; this function does not modify
+    it or the file on disk. It reads ``merged_scores_path`` back from disk
+    (guaranteed to already exist — every caller writes it before invoking
+    this function) joined against just the ``sample_id, lat, lon`` columns
+    of the wide parquet, both via DuckDB rather than pandas: with the
+    collection at 8M+ rows, an in-memory pandas string-key merge of two full
+    frames can transiently exceed a modest job's memory budget, whereas
+    DuckDB streams the join from the parquet files and spills to disk under
+    memory pressure instead of being OOM-killed. The joined result is
+    written out as GeoParquet (POINT geometry, EPSG:4326) next to the df
+    parquet, as ``<stem>_gdf.parquet``.
+
+    Returns the output path, or None if ``src_wide_path`` doesn't exist
+    (logged as a warning, not fatal — the df parquet is the primary output).
+    """
+    if not src_wide_path.exists():
+        logger.warning(
+            f"[gdf-export] Source wide parquet not found ({src_wide_path}); "
+            "skipping GeoParquet export of merged scores."
+        )
+        return None
+    if not merged_scores_path.exists():
+        raise FileNotFoundError(
+            f"[gdf-export] Merged scores parquet not found ({merged_scores_path}); "
+            "expected it to already be written to disk by this point in the pipeline."
+        )
+
+    n_before = len(merged_scores)
+    gdf_tmp_dir = merged_scores_path.parent / ".gdf_export_tmp"
+    gdf_tmp_dir.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect()
+    # Explicit memory_limit + temp_directory: on a memory-constrained job,
+    # DuckDB's own default limit can be looser than the job's actual cgroup
+    # cap, so without this it can still get OOM-killed materializing an 8M+
+    # row join instead of spilling to disk — this makes the spill happen
+    # before that point instead.
+    con.execute("SET memory_limit='6GB'")
+    con.execute(f"SET temp_directory='{gdf_tmp_dir}'")
+    df = con.execute(
+        """
+        SELECT m.*, w.lat, w.lon
+        FROM read_parquet(?) m
+        LEFT JOIN (SELECT sample_id, lat, lon FROM read_parquet(?)) w
+        USING (sample_id)
+        """,
+        [str(merged_scores_path), str(src_wide_path)],
+    ).df()
+    con.close()
+    for leftover in gdf_tmp_dir.glob("*"):
+        leftover.unlink(missing_ok=True)
+    gdf_tmp_dir.rmdir()
+
+    merged_with_latlon = df
+    if len(merged_with_latlon) != n_before:
+        raise RuntimeError(
+            f"[gdf-export] lat/lon join changed row count ({n_before:,} -> "
+            f"{len(merged_with_latlon):,}); sample_id is expected to be unique "
+            f"in both {merged_scores_path.name} and {src_wide_path.name}."
+        )
+    n_missing = int(merged_with_latlon["lat"].isna().sum())
+    if n_missing:
+        logger.warning(
+            f"[gdf-export] {n_missing:,}/{n_before:,} rows had no lat/lon match "
+            f"in {src_wide_path.name} — these rows get a null geometry."
+        )
+
+    gdf = gpd.GeoDataFrame(
+        merged_with_latlon,
+        geometry=gpd.points_from_xy(merged_with_latlon["lon"], merged_with_latlon["lat"]),
+        crs="EPSG:4326",
+    )
+    gdf_path = merged_scores_path.with_name(merged_scores_path.stem + "_gdf.parquet")
+    gdf.to_parquet(str(gdf_path), index=False)
+    logger.info(f"[gdf-export] merged scores (GeoParquet): {len(gdf):,} rows → {gdf_path}")
+    return gdf_path
 
 
 # ===========================================================================
@@ -1079,10 +1409,16 @@ def write_scores_to_wide_parquet(
     src_schema = src_pf.schema_arrow
     logger.info(f"wide source: {src_pf.metadata.num_rows:,} rows, {len(src_schema)} cols")
 
+    # base_fields always excludes anomaly_cols (below), so extra_fields must
+    # always (re-)add every one of them — even when the source already has
+    # them (e.g. stale NaN-stub columns from an earlier partial run). Only
+    # skipping already-present columns here silently drops them from the
+    # schema entirely instead of overwriting with fresh values. Always derive
+    # the dtype from scores_lookup (the fresh values being written), not from
+    # a stale source column, which may have been typed differently (e.g. an
+    # all-NaN stub column written as double instead of float32).
     extra_fields: list[pa.Field] = []
     for col in anomaly_cols:
-        if col in src_schema.names:
-            continue
         dtype = scores_lookup[col].dtype
         arrow_type = pa.float32() if str(dtype).startswith("float") else pa.string()
         extra_fields.append(pa.field(col, arrow_type))
@@ -1135,6 +1471,7 @@ def _run_scoring_rerun(
     write_review_parquets: bool,
     restrict_model_hash: Optional[str],
     debug: bool,
+    post_processing_skip_classes: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """Run both pipelines over the full DuckDB cache and return merged scores."""
     logger.info("[rerun] Running LANDCOVER10 scoring (full cache) ...")
@@ -1168,6 +1505,7 @@ def _run_scoring_rerun(
         cty24_df=cty24_df,
         merged_scores_path=merged_scores_path,
         overwrite=overwrite_merged_scores,
+        post_processing_skip_classes=post_processing_skip_classes,
     )
 
 
@@ -1332,6 +1670,7 @@ def _run_scoring_update(
     restrict_model_hash: Optional[str],
     debug: bool,
     parquet_glob: str = "**/*.parquet",
+    post_processing_skip_classes: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, set]:
     """Incrementally re-score only geographic slices affected by new data.
 
@@ -1457,6 +1796,8 @@ def _run_scoring_update(
     else:
         merged = cty24_df.merge(lc10_df, on=["ref_id", "sample_id"], how="outer")
 
+    merged = apply_score_postprocessing(merged, post_processing_skip_classes)
+
     logger.info(f"[update] Merged scores: {len(merged):,} rows "
                 f"(LC10: {len(lc10_df):,}, CTY24: {len(cty24_df):,})")
     return merged, all_rescored_ref_ids
@@ -1503,6 +1844,11 @@ def compute_anomaly_scores(
     skip_scoring: bool,
     skip_write_back: bool,
     compute: Optional[List[str]] = None,
+    post_processing_skip_classes: Optional[List[str]] = None,
+    skip_long_write_back: bool = False,
+    skip_wide_write_back: bool = False,
+    skip_gdf_export: bool = False,
+    rescan_wide_dir: bool = True,
 ) -> None:
     """Run the full anomaly scoring pipeline end to end.
 
@@ -1592,7 +1938,10 @@ def compute_anomaly_scores(
         )
 
         logger.info("[3/10] Merging wide parquets ...")
-        wide_files = [p for p in wide_files if p.exists()]
+        wide_files = collect_wide_files_for_merge(
+            effective_wide_dir, wide_files, rescan=rescan_wide_dir,
+        )
+        logger.info(f"  merging {len(wide_files)} wide parquet(s)")
         if not wide_files:
             raise RuntimeError("No wide parquet files available for merging.")
         merged_wide = merge_parquets_stream_to_one(
@@ -1666,6 +2015,7 @@ def compute_anomaly_scores(
                 write_review_parquets=True,
                 restrict_model_hash=None,
                 debug=False,
+                post_processing_skip_classes=post_processing_skip_classes,
             )
             # rescored_ref_ids stays None → write_scores_to_long_parquets rewrites all
 
@@ -1722,12 +2072,30 @@ def compute_anomaly_scores(
                 restrict_model_hash=None,
                 debug=False,
                 parquet_glob=parquet_glob,
+                post_processing_skip_classes=post_processing_skip_classes,
             )
             if merged_scores.empty:
                 logger.info("No re-scoring needed — all parquets are already up to date.")
                 return
         else:
             raise ValueError(f"Unknown mode: {mode!r}. Must be 'rerun' or 'update'.")
+
+    # ------------------------------------------------------------------
+    # Step 8c – GeoParquet export of merged scores (for QGIS viewing)
+    # ------------------------------------------------------------------
+    # Independent of write-back: this only reads lat/lon from the wide
+    # parquet and writes a *separate* "<merged_scores_path.stem>_gdf.parquet"
+    # sibling file — it never modifies merged_scores_path itself, which stays
+    # a plain df parquet with no geometry, as intended.
+    if skip_gdf_export:
+        logger.info("[8c] Skipping GeoParquet export of merged scores (--skip-gdf-export)")
+    else:
+        logger.info("[8c] Exporting merged scores as GeoParquet (for QGIS) ...")
+        export_merged_scores_geoparquet(
+            merged_scores=merged_scores,
+            merged_scores_path=merged_scores_path,
+            src_wide_path=effective_merged_wide,
+        )
 
     if skip_write_back:
         logger.info("[9–10/10] Skipping write-back (--skip-write-back)")
@@ -1740,35 +2108,58 @@ def compute_anomaly_scores(
     # ------------------------------------------------------------------
     # Step 9 – Write back to long parquets
     # ------------------------------------------------------------------
-    logger.info("[9/10] Writing scores to long-format parquets ...")
-    n_written = write_scores_to_long_parquets(
-        merged_scores=merged_scores,
-        input_long_dir=input_long_dir,
-        output_long_dir=effective_output_long,
-        anomaly_cols=anomaly_cols,
-        parquet_glob=parquet_glob,
-        only_affected_ref_ids=rescored_ref_ids,  # None = write all; set = write only affected
-    )
-    logger.info(f"  wrote {n_written} files → {effective_output_long}")
+    # Independently skippable: the long-format parquets aren't always all
+    # present in input_long_dir (unlike the wide/merged parquet in step 10,
+    # which is always available), so this step can be turned off on its own
+    # via --skip-long-write-back without disabling step 10.
+    if skip_long_write_back:
+        logger.info("[9/10] Skipping long-parquet write-back (--skip-long-write-back)")
+    else:
+        logger.info("[9/10] Writing scores to long-format parquets ...")
+        n_written = write_scores_to_long_parquets(
+            merged_scores=merged_scores,
+            input_long_dir=input_long_dir,
+            output_long_dir=effective_output_long,
+            anomaly_cols=anomaly_cols,
+            parquet_glob=parquet_glob,
+            only_affected_ref_ids=rescored_ref_ids,  # None = write all; set = write only affected
+        )
+        logger.info(f"  wrote {n_written} files → {effective_output_long}")
 
     # ------------------------------------------------------------------
     # Step 10 – Write back to merged wide parquet
     # ------------------------------------------------------------------
-    logger.info("[10/10] Writing scores to merged wide parquet ...")
-    if not effective_merged_wide.exists():
-        logger.warning(
-            f"Merged wide parquet not found ({effective_merged_wide}); skipping wide write-back."
-        )
+    if skip_wide_write_back:
+        logger.info("[10/10] Skipping wide-parquet write-back (--skip-wide-write-back)")
     else:
-        write_scores_to_wide_parquet(
-            merged_scores=merged_scores,
-            src_wide_path=effective_merged_wide,
-            output_wide_path=effective_output_wide,
-            anomaly_cols=anomaly_cols,
-            batch_rows=merge_cfg.batch_rows,
-            row_group_size=merge_cfg.row_group_size,
-            overwrite=overwrite_wide_scores,
-        )
+        logger.info("[10/10] Writing scores to merged wide parquet ...")
+        if not effective_merged_wide.exists():
+            if skip_long_write_back:
+                # Both write-back paths are now inactive: long was explicitly
+                # skipped, and wide has nowhere to write either. Silently
+                # warning here means the whole pipeline computes scores and
+                # then discards them with exit code 0 — fail loudly instead.
+                raise FileNotFoundError(
+                    f"Merged wide parquet not found ({effective_merged_wide}) and "
+                    "--skip-long-write-back is set, so there is no remaining "
+                    "write-back path — scores were computed but would not be "
+                    "written anywhere. Pass --merged-wide-path / set "
+                    "MERGED_WIDE_PATH to the correct file, or drop "
+                    "--skip-long-write-back."
+                )
+            logger.warning(
+                f"Merged wide parquet not found ({effective_merged_wide}); skipping wide write-back."
+            )
+        else:
+            write_scores_to_wide_parquet(
+                merged_scores=merged_scores,
+                src_wide_path=effective_merged_wide,
+                output_wide_path=effective_output_wide,
+                anomaly_cols=anomaly_cols,
+                batch_rows=merge_cfg.batch_rows,
+                row_group_size=merge_cfg.row_group_size,
+                overwrite=overwrite_wide_scores,
+            )
 
     logger.info("Pipeline complete.")
 
@@ -1896,6 +2287,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size",         type=int, default=4096)
     p.add_argument("--num-workers",        type=int, default=2)
     p.add_argument("--parquet-batch-rows", type=int, default=100_000)
+    p.add_argument(
+        "--rescan-wide-dir", action=argparse.BooleanOptionalAction, default=True,
+        help=("Before merging (step 3), rescan the wide dir and include every "
+              "*_ppq.parquet found there, not just the ones mapped from files "
+              "in --input-long-dir. This is what the notebooks do, and it is "
+              "what lets wide parquets backfilled from an earlier run reach the "
+              "merged parquet — without it their samples are absent from the "
+              "merged wide file, so the step-10 write-back has no row to attach "
+              "their scores to. --no-rescan-wide-dir restores the "
+              "input-derived-only list."))
     p.add_argument("--force-recompute",    action="store_true")
     p.add_argument("--prematch", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--no-progress", action="store_true")
@@ -1955,6 +2356,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         metavar=("LO", "HI"))
     common.add_argument("--fdr-alpha",           type=float, default=0.05)
     common.add_argument("--skip-classes",        type=str, nargs="+", default=["ignore"])
+    common.add_argument(
+        "--post-processing-skip-classes", type=str, nargs="+", default=["ignore", "trees"],
+        help=(
+            "Applied AFTER scoring (independent of --skip-classes, which excludes "
+            "samples from scoring entirely): any row whose scored LC10 or CTY24 "
+            "class is in this list has its confidence/flag reset to 1.0/'normal' "
+            "post-hoc. Rows in a terminal non-judged state (unscored / unscorable "
+            "/ unmapped / skipped) are left alone either way. Matches the "
+            "notebook's POST_PROCESSING_SKIP_CLASSES. Pass an empty value to disable."
+        ),
+    )
     common.add_argument("--max-full-pairwise-n", type=int, default=0)
     common.add_argument(
         "--group-cols", type=str, nargs="*", default=[],
@@ -1975,6 +2387,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "reference collection spans many years, so without this a sample "
             "from a minority year is distant for phenological rather than label "
             "reasons — a major source of false positives."
+        ),
+    )
+    common.add_argument(
+        "--context-group-cols", type=str, nargs="*", default=[],
+        help=(
+            "Extra columns joining the CONTEXT key used by the kNN-purity and "
+            "alt-class-margin signals — separate from --group-cols (the slice "
+            "key). Defaults to empty (geographic context only) and deliberately "
+            "does NOT inherit --group-cols: restricting context to the same "
+            "ref_id would make those signals collapse for single-crop datasets "
+            "(every point trivially has purity 1.0, no alternative class to "
+            "measure a margin against). Only override if you know you want "
+            "per-dataset context."
         ),
     )
 
@@ -2041,6 +2466,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
                             "mismatch instead of warning."))
     absg.add_argument("--no-quality-gate", action="store_true",
                       help="Skip embedding validation (not recommended).")
+    absg.add_argument("--centroid-mode",       type=str, default="trimmed",
+                      help="Slice-centroid estimator, e.g. 'trimmed' or 'mean'.")
+    absg.add_argument("--centroid-trim",       type=float, default=0.45,
+                      help=("Trim fraction used when --centroid-mode=trimmed. Higher "
+                            "than the pre-absolute-gate default (0.05) — the centroid "
+                            "now also has to resist heavy per-slice contamination "
+                            "feeding the cross-slice null."))
+    absg.add_argument("--gate-confidence-by-flag", action=argparse.BooleanOptionalAction, default=True,
+                      help="Zero out confidence_nonoutlier for flagged points (matches notebook default).")
+    absg.add_argument("--apply-slice-trust",   action=argparse.BooleanOptionalAction, default=False,
+                      help="Down-weight low-trust slices when scoring.")
+    absg.add_argument("--slice-trust-min",     type=float, default=0.05,
+                      help="Minimum slice-trust value used when --apply-slice-trust is set.")
 
     # Update-specific
     upd = p.add_argument_group("update mode")
@@ -2074,7 +2512,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     sk.add_argument(
         "--skip-write-back", action="store_true",
-        help="Skip steps 9–10 (writing scores back to long/wide parquets).",
+        help="Skip both steps 9 and 10 (writing scores back to long AND wide parquets).",
+    )
+    sk.add_argument(
+        "--skip-long-write-back", action="store_true",
+        help=(
+            "Skip step 9 only (writing scores back to long-format parquets). "
+            "Useful when input_long_dir doesn't reliably contain every long "
+            "parquet file — step 10 (wide/merged parquet) still runs."
+        ),
+    )
+    sk.add_argument(
+        "--skip-wide-write-back", action="store_true",
+        help="Skip step 10 only (writing scores back to the merged wide parquet).",
+    )
+    sk.add_argument(
+        "--skip-gdf-export", action="store_true",
+        help=(
+            "Skip step 8c only (writing the '<merged_scores>_gdf.parquet' "
+            "GeoParquet sibling for QGIS viewing). Does not affect the plain "
+            "df merged-scores parquet, which is always written."
+        ),
     )
 
     # One-off recomputations
@@ -2146,6 +2604,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         skip_classes=args.skip_classes,
         max_full_pairwise_n=args.max_full_pairwise_n,
         group_cols=list(args.group_cols or []),
+        context_group_cols=list(args.context_group_cols or []),
         time_col=args.time_col,
         require_absolute=not bool(args.no_absolute_gate),
         abs_z_k=args.abs_z_k,
@@ -2163,6 +2622,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_scoring_slice_size=args.min_scoring_slice_size,
         quality_gate=not bool(args.no_quality_gate),
         strict_quality=bool(args.strict_quality),
+        centroid_mode=args.centroid_mode,
+        centroid_trim=args.centroid_trim,
+        gate_confidence_by_flag=bool(args.gate_confidence_by_flag),
+        apply_slice_trust=bool(args.apply_slice_trust),
+        slice_trust_min=args.slice_trust_min,
     )
     lc10_config = AnomalyRunConfig(
         label_domain=args.lc10_class_mapping,
@@ -2219,7 +2683,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         skip_embeddings=bool(args.skip_embeddings),
         skip_scoring=bool(args.skip_scoring),
         skip_write_back=bool(args.skip_write_back),
+        skip_long_write_back=bool(args.skip_long_write_back),
+        skip_wide_write_back=bool(args.skip_wide_write_back),
+        skip_gdf_export=bool(args.skip_gdf_export),
+        rescan_wide_dir=bool(args.rescan_wide_dir),
         compute=args.compute_h3_levels,
+        post_processing_skip_classes=args.post_processing_skip_classes,
     )
     return 0
 
