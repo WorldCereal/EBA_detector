@@ -647,8 +647,10 @@ def run_pipeline(
     abs_z_k: float = 3.3,
     abs_z_suspect: float = 4.0,
     abs_z_candidate: float = 5.5,
-    null_extra_keys: Optional[Sequence[str]] = ("h3_null_region",),
-    null_region_level: Optional[int] = 1,
+    null_extra_keys: Optional[Sequence[str]] = ("h3_null_region", "h3_null_res"),
+    null_region_offset: int = 2,
+    null_region_min_level: int = 1,
+    null_region_level: Optional[int] = None,
     null_shrink_k: float = 5.0,
     abs_combine: str = "min",
     null_scale_estimator: str = "left_tail",
@@ -753,8 +755,51 @@ def run_pipeline(
         contaminated slice cannot calibrate its own errors away.  Set
         ``require_absolute=False`` to reproduce the legacy relative-only
         behaviour for ablations.
-    null_extra_keys, null_region_level
+    null_extra_keys, null_region_offset, null_region_min_level, null_region_level
         How the cross-slice null is localised.
+
+        *null_extra_keys* is read as a **nesting, coarsest first**.  The null is
+        estimated at every prefix — ``(class)``, ``(class, region)``,
+        ``(class, region, resolution)`` — and each row is calibrated against the
+        *finest group that exists for it*, with every depth shrunk toward its
+        own parent rather than toward the flat global null.  That ladder is what
+        makes a second conditioner safe: every conditioner thins the groups, and
+        without backing off, a thin ``(class, region, resolution)`` group fell
+        all the way to a resolution-blind global null — reinstating exactly the
+        mixing the key was added to remove, for exactly the rare-class-in-a-
+        fine-cell case that needed it.  For CROPTYPE24 that is most classes.
+
+        The default keys are ``("h3_null_region", "h3_null_res")``: *where* the
+        slice is, then *at what scale* it was sliced.  Region first, so a thin
+        group keeps its locality — measured over four regions x three
+        resolutions, region-then-resolution gave 0.46 % clean false positives
+        with a flat regional profile (0.36 % / 0.51 %), resolution-then-region
+        0.51 % with the regional gradient back (0.07 % / 0.91 %).
+
+        Measured end to end on a co-located L2/L3/L4 croptype run, 15 % planted
+        errors::
+
+            class only                     recall 30.9 %  FP 0.368 %
+            class + fixed L1 region        recall 30.9 %  FP 0.368 %
+            class + relative region        recall 37.4 %  FP 0.150 %
+            class + region + resolution    recall 38.5 %  FP 0.109 %
+
+        The two keys fix different levels.  The RELATIVE REGION rescues L4
+        (recall 32 % -> 71 %), because an L4 slice's region is an L2 cell
+        holding only other L4 slices — the region separates resolutions there
+        by itself.  The RESOLUTION key does the rest: L2 and L3 slices share
+        one L1 region, and separating them lifts L3 recall 25 % -> 31 % while
+        halving L2's false positives 0.37 % -> 0.20 %.
+
+        L2 recall falls throughout (23 % -> 13 %) as part of the same trade:
+        the old scheme was manufacturing detections there from an
+        under-estimated scale, and paying 0.90 % false positives for them.
+
+        For a two-level LANDCOVER10 run (``h3_level=[2, 3]``) both levels floor
+        to the same L1 region, so only the resolution key bites: recall flat
+        (24.8 % -> 25.0 %) at half the false positives (0.252 % -> 0.112 %),
+        with L3 recall 28 % -> 33 %.  The same defaults serve both domains; no
+        landcover-specific setting is needed.
 
         The null answers "how far from its own slice centroid does a typical
         sample of this class sit?".  Pooling that question **globally** is
@@ -779,12 +824,34 @@ def run_pipeline(
         the null on the region flattens it to 0.29-0.67 % everywhere and cuts
         the overall rate from 1.51 % to 0.49 %.
 
-        *null_region_level* is the H3 resolution of that region key: the slice
-        cell's parent at this level is written to ``h3_null_region`` and used as
-        a null conditioner.  Level 1 (~610,000 km2, ~880 km across) holds ~50 L3
-        cells, enough slices to estimate a null for a common class while staying
-        far more homogeneous than a global pool.  Use 2 for tighter locality
-        where density supports it, or ``None`` to disable the region key.
+        The region is defined **relative to the slice's own H3 resolution**::
+
+            region_level = max(slice_res - null_region_offset,
+                               null_region_min_level)
+
+        so every slice is calibrated against roughly the same *number* of
+        sibling cells (~49 at the default offset of 2) rather than the same
+        absolute area.  A fixed absolute level is wrong as soon as a run spans
+        more than one resolution: with ``h3_level=[2, 3, 4]`` and a fixed L1
+        region, L2 (86,802 km2), L3 (12,393 km2) and L4 (1,770 km2) slices all
+        land in the same null group, and a bigger cell spans more legitimate
+        variation.  The tight L4 slices inherit a scale inflated by the coarse
+        L2 ones and their real outliers fall under the gate.  Measured on a
+        mixed L2/L3/L4 run, a fixed L1 region was **worse than using no region
+        at all** (clean false positives 1.35 % vs 1.19 %, and 1.33 % vs 0.62 %
+        at L3); the relative region gives 0.89 %.  That is why a two-level
+        LANDCOVER10 run improved while a three-level CROPTYPE24 run regressed.
+
+        The default offset preserves the LANDCOVER10 mapping exactly (L3 -> L1)
+        and only changes the L4 population, which is where dense-region croptype
+        lives.  The region key does not separate resolutions on its own — floored
+        at *null_region_min_level*, one L1 region holds both L2 and L3 slices —
+        which is why ``h3_null_res`` is a key in its own right.
+
+        Set *null_region_level* to pin an absolute resolution instead (legacy,
+        and wrong for any multi-resolution run), ``null_extra_keys=
+        ["h3_null_region"]`` to drop only the resolution key, or
+        ``null_extra_keys=[]`` to pool globally.
 
         *null_shrink_k* controls how much locality is actually spent.  The
         dominant effect is localisation itself — measured at 3, 5, 12 and 25
@@ -793,11 +860,13 @@ def run_pipeline(
         support level.  Shrinkage is *insurance*, not the source of the gain: a
         null estimated from a couple of slices is noisy, and on real geography,
         where regions straddle hexagon boundaries and some groups fall back,
-        an unshrunk local null did misbehave.  Each local null is therefore
-        shrunk toward the global one by
+        an unshrunk local null did misbehave.  Each null is therefore shrunk
+        toward **its own parent in the ladder** (not the flat global null) by
         ``w = n_slices / (n_slices + null_shrink_k)``, so a region with 30
         slices sits at w = 0.86 and one with 3 sits at w = 0.38.  There is no
-        threshold to trip over and sparse regions degrade smoothly.
+        threshold to trip over and sparse groups degrade smoothly, one rung at
+        a time.  Below *min_slices* the weight is 0: the group has no standing
+        to hold an opinion of its own and simply *is* its parent.
 
         Be clear that this is a **trade, not a free win**.  Averaged over five
         seeds on regions of differing legitimate spread::
@@ -1308,27 +1377,106 @@ def run_pipeline(
     # everywhere: without it, every slice is min-max normalised onto [0, 1] and
     # therefore yields the same proportion of "suspects" whether it is clean or
     # 30 % mislabelled.
-    # Region key for the null.  Derived from the slice cell AFTER merging, so a
-    # merged slice is attributed to the region it actually sits in.
-    if null_region_level is not None and h3_level_name in scored_df.columns:
-        def _parent_at(cell):
+    # ------------------------------------------------------------------
+    # Region key for the null.
+    #
+    # The region is defined RELATIVE to the slice's own H3 resolution:
+    #
+    #     region_level = max(slice_resolution - null_region_offset,
+    #                        null_region_min_level)
+    #
+    # so every slice is calibrated against roughly the same *number* of
+    # sibling cells (~49 at offset 2) rather than the same absolute area.
+    #
+    # An absolute region level is wrong as soon as a run uses more than one H3
+    # resolution.  With h3_level=[2,3,4] and a fixed L1 region, slices at L2
+    # (86,802 km2), L3 (12,393 km2) and L4 (1,770 km2) all land in the SAME
+    # null group — and their distance distributions differ systematically,
+    # because a bigger cell spans more legitimate variation.  The tight L4
+    # slices then inherit a scale inflated by the coarse L2 ones and their real
+    # outliers fall under the gate.  Measured on a mixed L2/L3/L4 run, a fixed
+    # L1 region was WORSE than using no region at all (clean false positives
+    # 1.35 % vs 1.19 %, and 1.33 % vs 0.62 % at L3); the relative region gives
+    # 0.89 %.  This is why a two-level LANDCOVER10 run ([2,3], almost all L3 in
+    # dense regions) improved while a three-level CROPTYPE24 run ([2,3,4])
+    # regressed.
+    #
+    # Note the offset preserves the LC10 behaviour exactly (L3 -> L1) and only
+    # changes the L4 population, which is where dense-region croptype lives.
+    #
+    # Set null_region_level to pin an absolute resolution instead (legacy).
+    # ------------------------------------------------------------------
+    if h3_level_name in scored_df.columns and (
+        null_region_level is not None or null_region_offset is not None
+    ):
+        def _region_of(cell):
             try:
                 c = str(cell)
-                if h3.get_resolution(c) <= int(null_region_level):
-                    return c
-                return h3.cell_to_parent(c, int(null_region_level))
+                res = h3.get_resolution(c)
+                if null_region_level is not None:
+                    tgt = int(null_region_level)
+                else:
+                    tgt = max(res - int(null_region_offset), int(null_region_min_level))
+                tgt = min(tgt, res)
+                return c if res <= tgt else h3.cell_to_parent(c, tgt)
             except Exception:
                 return None
 
         _uniq = pd.unique(scored_df[h3_level_name].astype(str))
-        _map = {c: _parent_at(c) for c in _uniq}
+        _map = {c: _region_of(c) for c in _uniq}
         scored_df["h3_null_region"] = scored_df[h3_level_name].astype(str).map(_map)
+
+        # The slice's own H3 resolution is a null conditioner in its own right.
+        # Distance distributions scale with cell size (L2 spans 49x the area of
+        # L4), and the relative region does NOT separate resolutions on its
+        # own: floored at `null_region_min_level`, one L1 region holds both L2
+        # and L3 slices.  Without this key those two share a null and the
+        # tighter one inherits an inflated scale — the CROPTYPE24 ([2, 3, 4])
+        # regression, which a two-level LANDCOVER10 run barely felt.
+        #
+        # It is ranked BELOW the region in `null_extra_keys`, so a group too
+        # thin for (class, region, res) backs off to (class, region) rather
+        # than to a region-blind (class, res): measured on four regions x three
+        # resolutions, region-then-res gave 0.46 % clean false positives with a
+        # flat regional profile (0.36 % / 0.51 %), res-then-region 0.51 % with
+        # the regional gradient back (0.07 % / 0.91 %).  Locality first.
+        def _res_of(cell):
+            try:
+                return int(h3.get_resolution(str(cell)))
+            except Exception:
+                return -1
+
+        _rmap = {c: _res_of(c) for c in _uniq}
+        scored_df["h3_null_res"] = (
+            scored_df[h3_level_name].astype(str).map(_rmap).astype("int16")
+        )
         _n_bad = int(scored_df["h3_null_region"].isna().sum())
         if _n_bad:
+            # They do NOT fall back to the global null: a missing region is a
+            # group of its own ("unknown region"), and the ladder lets it back
+            # off to the class-level null if that group turns out to be thin.
             print(
-                f"[anomaly] {_n_bad:,} rows have no derivable L{null_region_level} "
-                "region key; their null falls back to the global one."
+                f"[anomaly] {_n_bad:,} rows have no derivable null region; "
+                "they are calibrated as one 'unknown region' group per class."
             )
+        # Reuse _rmap rather than re-deriving, and do not wrap this in a bare
+        # except: the diagnostic that says the region keys are wrong is exactly
+        # the one you must not suppress when they are.
+        _res_seen = sorted({v for v in _rmap.values() if v >= 0})
+        _reg_seen = sorted(
+            {
+                r
+                for c in _uniq
+                if _map[c] is not None
+                for r in (_res_of(_map[c]),)
+                if r >= 0
+            }
+        )
+        print(
+            f"[anomaly] Null regions: slice levels {_res_seen} "
+            f"-> region levels {_reg_seen} "
+            f"({scored_df['h3_null_region'].nunique():,} distinct regions)"
+        )
 
     null_keys = [label_col, *(list(null_extra_keys) if null_extra_keys else [])]
     null_keys = [k for k in null_keys if k in scored_df.columns]
@@ -1362,18 +1510,42 @@ def run_pipeline(
         )
         # How localised was the null in practice?  A high fallback rate means
         # the region level is too fine for this collection's density.
-        if len(null_keys) > 1:
-            _own = null_ref[null_ref.get("__is_global__", False) != True]  # noqa: E712
-            _have = (
-                set(map(tuple, _own[null_keys].astype(str).to_numpy()))
-                if len(_own) else set()
+        if len(null_keys) > 1 and "abs_z_null_depth" in scored_df.columns:
+            # The ladder resolves each row at the deepest null group that
+            # exists for it; the depth histogram is how localised the
+            # calibration actually was.  Depth 0 = the flat global null.
+            _glob = (
+                null_ref["__is_global__"].fillna(False).astype(bool).to_numpy()
+                if "__is_global__" in null_ref.columns
+                else np.zeros(len(null_ref), dtype=bool)
             )
-            _rk = list(map(tuple, scored_df[null_keys].astype(str).to_numpy()))
-            _fb = sum(1 for k in _rk if k not in _have)
+            _own = null_ref[~_glob]
+            _d = scored_df.loc[
+                scored_df["scored"].fillna(False).astype(bool), "abs_z_null_depth"
+            ]
+            _n = max(len(_d), 1)
+            _counts = sorted(
+                _d.clip(lower=0).value_counts().items(), key=lambda kv: -int(kv[0])
+            )
+            _hist = (
+                ", ".join(
+                    f"{('(' + ', '.join(null_keys[: int(k)]) + ')') if int(k) > 0 else 'global'}"
+                    f" {int(v) / _n:.0%}"
+                    for k, v in _counts
+                )
+                or "nothing scored"
+            )
+            _n_depths = (
+                int(_own["__null_depth__"].nunique())
+                if "__null_depth__" in _own.columns
+                else 1
+            )
+            # The depth reported is the deepest rung that actually CONTRIBUTED
+            # (w > 0), not merely the deepest group that exists — a group below
+            # min_slices equals its parent exactly and is credited to the parent.
             print(
-                f"[anomaly] Null localised on {null_keys}: {len(_own):,} local "
-                f"nulls; {_fb / max(len(_rk), 1):.1%} of rows fell back to the "
-                "global null (coarsen null_region_level if this is high)."
+                f"[anomaly] Null ladder {null_keys}: {len(_own):,} groups across "
+                f"{_n_depths} depths; rows calibrated at -> {_hist}"
             )
         _z_equiv = suggest_abs_z_threshold(
             scored_df, target_flag_fraction=0.02, scored_mask_col="scored"

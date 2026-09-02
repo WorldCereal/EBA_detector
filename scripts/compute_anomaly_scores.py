@@ -302,10 +302,21 @@ class AnomalyRunConfig:
     # raises their precision (0.95 -> 0.99).  Add a continent or year column
     # here too if you know distance scales differ across them.  The column is
     # silently ignored in fixed (non-adaptive) H3 mode, where it does not exist.
+    # Read as a NESTING, coarsest first: the null is estimated at every prefix
+    # ("class", then "class x region", then "class x region x resolution") and
+    # each row is calibrated against the finest group that exists for it.  The
+    # resolution key is what stops L2/L3/L4 slices sharing one null; it comes
+    # last so a thin group backs off to its region rather than losing locality.
     null_extra_keys: Optional[List[str]] = field(
-        default_factory=lambda: ["h3_null_region"]
+        default_factory=lambda: ["h3_null_region", "h3_null_res"]
     )
-    null_region_level: Optional[int] = 1
+    # Region defined RELATIVE to each slice's own H3 resolution:
+    #   region_level = max(slice_res - offset, min_level)
+    # A fixed absolute level mixes resolutions in one null group and was
+    # measurably worse than no region at all on a 3-level (CROPTYPE24) run.
+    null_region_offset: int = 2
+    null_region_min_level: int = 1
+    null_region_level: Optional[int] = None   # absolute override (legacy)
     null_shrink_k: float = 5.0
     # --- support / quality ------------------------------------------------
     min_scoring_slice_size: int = 50
@@ -843,6 +854,8 @@ def run_single_domain_scoring(
             abs_combine=config.abs_combine,
             null_scale_estimator=config.null_scale_estimator,
             null_extra_keys=config.null_extra_keys,
+            null_region_offset=config.null_region_offset,
+            null_region_min_level=config.null_region_min_level,
             null_region_level=config.null_region_level,
             null_shrink_k=config.null_shrink_k,
             min_scoring_slice_size=config.min_scoring_slice_size,
@@ -1990,18 +2003,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
                       help=("How to combine the centroid-distance and kNN-distance "
                             "z-scores. 'min' (default) demands both."))
     absg.add_argument(
-        "--null-extra-keys", type=str, nargs="*", default=["h3_null_region"],
+        "--null-extra-keys", type=str, nargs="*",
+        default=["h3_null_region", "h3_null_res"],
         help=("Extra columns conditioning the cross-slice null beyond the "
-              "label class (e.g. a continent or year column). Use when "
-              "legitimate distance scales differ systematically between "
-              "regions/periods, otherwise heterogeneous regions inherit a "
-              "false-positive bias from the pooled null."))
-    absg.add_argument("--null-region-level", type=int, default=1,
-                      help=("H3 resolution of the region key the cross-slice null "
-                            "is conditioned on (L1 ~610,000 km2). A class's "
-                            "legitimate dispersion differs region to region, so a "
-                            "globally pooled null makes more-variable landscapes "
-                            "look anomalous as a whole. Use -1 to disable."))
+              "label class (e.g. a continent or year column), read as a "
+              "nesting from coarsest to finest. The null is estimated at "
+              "every prefix and each row uses the finest group that exists "
+              "for it, so adding a conditioner cannot strand thinly-supported "
+              "groups on the flat global null."))
+    absg.add_argument("--null-region-offset", type=int, default=2,
+                      help=("The null region is the slice cell's parent this many "
+                            "H3 levels up: region_level = max(slice_res - offset, "
+                            "min_level). Relative, so every slice is calibrated "
+                            "against ~the same NUMBER of sibling cells regardless "
+                            "of the resolution it resolved at. A fixed absolute "
+                            "level mixes resolutions in one null group and was "
+                            "measurably worse than no region at all on a 3-level "
+                            "run."))
+    absg.add_argument("--null-region-min-level", type=int, default=1,
+                      help="Floor on the region resolution (default L1).")
+    absg.add_argument("--null-region-level", type=int, default=-1,
+                      help=("Pin an ABSOLUTE region resolution instead of the "
+                            "relative offset (legacy). -1 = use the offset."))
     absg.add_argument("--null-shrink-k", type=float, default=5.0,
                       help=("Shrinkage of each regional null toward the global one: "
                             "w = n_slices/(n_slices+k). A hard local null is noisy "
@@ -2131,8 +2154,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         abs_combine=args.abs_combine,
         null_scale_estimator=args.null_scale_estimator,
         null_extra_keys=list(args.null_extra_keys) if args.null_extra_keys else [],
-        null_region_level=(None if args.null_region_level is not None
-                           and args.null_region_level < 0 else args.null_region_level),
+        null_region_offset=args.null_region_offset,
+        null_region_min_level=args.null_region_min_level,
+        null_region_level=(None if args.null_region_level is None
+                           or args.null_region_level < 0 else args.null_region_level),
         null_shrink_k=args.null_shrink_k,
         purity_veto=args.purity_veto,
         min_scoring_slice_size=args.min_scoring_slice_size,

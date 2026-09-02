@@ -883,3 +883,552 @@ class TestRegionalNull:
                          (h & t).sum() / max(h.sum(), 1))
         assert out["regional"][0] > 0.9 * out["global"][0], out
         assert out["regional"][1] >= out["global"][1] - 0.02, out
+
+
+# ---------------------------------------------------------------------------
+# 11. The null region must scale with the slice's own resolution
+# ---------------------------------------------------------------------------
+
+
+def _mixed_resolution_h3_world(contamination=0.0, levels=(2, 3, 4),
+                               per_level=10, n=150, seed=0):
+    """Slices at several real H3 resolutions in one broad area.
+
+    Dispersion scales with cell size because a bigger cell spans more
+    legitimate variation — which is exactly why they must not share a null.
+    """
+    import h3
+
+    r = np.random.default_rng(seed)
+    sigma = {2: 0.42, 3: 0.28, 4: 0.18}
+    rows = []
+    for lvl in levels:
+        for s in range(per_level):
+            lat = 47.0 + (0.35 * s if lvl == 4 else 1.2 * s if lvl == 3 else 3.0 * s)
+            cell = h3.latlng_to_cell(lat, 2.0 + 0.1 * s, lvl)
+            c = r.normal(size=D) * 0.15 + np.eye(D)[0]
+            X = r.normal(size=(n, D)) * sigma[lvl] + c
+            n_out = int(contamination * n)
+            if n_out:
+                X[:n_out] = r.normal(size=(n_out, D)) * 0.20 + (
+                    r.normal(size=D) * 0.15 + np.eye(D)[1]
+                )
+            for i in range(n):
+                rows.append((f"L{lvl}s{s}_{i}", cell, "maize",
+                             X[i].astype(np.float32), lvl, i < n_out))
+    return pd.DataFrame(
+        rows,
+        columns=["sample_id", "h3_l3_cell", "label", "embedding", "lvl", "truth"],
+    )
+
+
+def _region_key(cell, offset=None, absolute=None, floor=1):
+    import h3
+
+    res = h3.get_resolution(str(cell))
+    tgt = int(absolute) if absolute is not None else max(res - int(offset), floor)
+    tgt = min(tgt, res)
+    return str(cell) if res <= tgt else h3.cell_to_parent(str(cell), tgt)
+
+
+class TestNullRegionScalesWithResolution:
+    def _flag(self, df, **region):
+        d = df.copy()
+        if region:
+            d["region"] = [_region_key(c, **region) for c in d["h3_l3_cell"]]
+            keys = ["region"]
+        else:
+            keys = []
+        return _flag_with_null(d, keys)
+
+    def test_absolute_region_mixes_resolutions_and_is_worse_than_none(self):
+        """The croptype regression, pinned.
+
+        With h3_level=[2,3,4] and a fixed L1 region, L2/L3/L4 slices share one
+        null group.  The tight L4 slices inherit a scale set partly by the
+        coarse L2 ones, and a fixed region ends up worse than no region at all.
+        """
+        clean = _mixed_resolution_h3_world()
+        none = self._flag(clean)["flagged"].mean()
+        absolute = self._flag(clean, absolute=1)["flagged"].mean()
+        assert absolute >= none * 0.95, (absolute, none)
+
+    def test_relative_region_beats_both(self):
+        clean = _mixed_resolution_h3_world()
+        none = self._flag(clean)["flagged"].mean()
+        absolute = self._flag(clean, absolute=1)["flagged"].mean()
+        relative = self._flag(clean, offset=2)["flagged"].mean()
+        assert relative < none, (relative, none)
+        assert relative < absolute, (relative, absolute)
+
+    def test_relative_region_helps_the_finest_slices_most(self):
+        """L4 is where dense-region croptype lives."""
+        dirty = _mixed_resolution_h3_world(contamination=0.20, seed=3)
+        rec = {}
+        for name, kw in (("absolute", dict(absolute=1)), ("relative", dict(offset=2))):
+            fl = self._flag(dirty, **kw)
+            m = fl["lvl"] == 4
+            t = fl.loc[m, "truth"].to_numpy()
+            h = fl.loc[m, "flagged"].to_numpy()
+            rec[name] = (h & t).sum() / max(t.sum(), 1)
+        assert rec["relative"] >= rec["absolute"], rec
+
+    def test_single_resolution_run_is_unaffected(self):
+        """A two-level LANDCOVER10-style run maps L3 -> L1 either way."""
+        assert _region_key("832da1fffffffff", offset=2) == _region_key(
+            "832da1fffffffff", absolute=1
+        )
+
+    def test_floor_stops_the_region_going_coarser_than_l1(self):
+        import h3
+
+        l2 = h3.latlng_to_cell(47.0, 2.0, 2)
+        assert h3.get_resolution(_region_key(l2, offset=2)) == 1
+
+
+# ---------------------------------------------------------------------------
+# The hierarchical null ladder
+# ---------------------------------------------------------------------------
+def _colocated_multires_world(contamination=0.0, levels=(2, 3, 4), per_level=8,
+                              n=150, n_classes=3, seed=0):
+    """Multi-resolution slices that all sit inside ONE L1 cell.
+
+    Co-location is what makes the failure visible: when the resolutions happen
+    to fall in different L1 cells, geography separates them by accident and any
+    region scheme looks fine.  Real dense-Europe croptype is co-located.
+    """
+    import h3
+
+    r = np.random.default_rng(seed)
+    sigma = {2: 0.42, 3: 0.28, 4: 0.18}
+    root = h3.latlng_to_cell(47.0, 2.0, 1)
+    cens = []
+    for _ in range(n_classes):
+        v = r.normal(size=D)
+        cens.append(v / np.linalg.norm(v))
+    rows = []
+    for lvl in levels:
+        kids = sorted(h3.cell_to_children(root, lvl))[:per_level]
+        for s, cell in enumerate(kids):
+            for c in range(n_classes):
+                X = r.normal(size=(n, D)) * sigma[lvl] + cens[c]
+                n_out = int(contamination * n)
+                if n_out:
+                    X[:n_out] = (
+                        r.normal(size=(n_out, D)) * sigma[lvl]
+                        + cens[(c + 1) % n_classes]
+                    )
+                for i in range(n):
+                    rows.append((f"L{lvl}s{s}c{c}_{i}", cell, f"cls{c}",
+                                 X[i].astype(np.float32), lvl, i < n_out))
+    return pd.DataFrame(
+        rows,
+        columns=["sample_id", "h3_l3_cell", "label", "embedding", "lvl", "truth"],
+    )
+
+
+def _with_null_cols(df, offset=2, floor=1):
+    import h3
+
+    d = df.copy()
+    d["region"] = [_region_key(c, offset=offset, floor=floor) for c in d["h3_l3_cell"]]
+    # int dtype on purpose — the ladder must survive the widening to float that
+    # concatenating depths would otherwise cause.
+    d["res"] = np.asarray(
+        [h3.get_resolution(str(c)) for c in d["h3_l3_cell"]], dtype="int16"
+    )
+    return d
+
+
+def _score_frame(df):
+    parts = []
+    for _k, g in df.groupby(["h3_l3_cell", "label"], sort=True):
+        sc = compute_scores_for_slice(
+            g, max_full_pairwise_n=0, force_knn=True, centroid_trim=0.45
+        )
+        sc["scored"] = True
+        parts.append(sc)
+    return pd.concat(parts, ignore_index=True)
+
+
+def _calibrate(scored, keys, shrink_k=5.0, min_slices=2):
+    null_ref = compute_null_reference(
+        scored, null_keys=keys, slice_key_cols=["h3_l3_cell", "label"],
+        scored_mask_col="scored", shrink_k=shrink_k, min_slices=min_slices,
+    )
+    return add_absolute_scores(scored, null_ref, null_keys=keys), null_ref
+
+
+class TestNullLadder:
+    """`null_keys` is a nesting; each row uses the finest group it has."""
+
+    def test_integer_key_survives_the_depth_concat(self):
+        """Regression: "3" vs "3.0".
+
+        Ladder depths are concatenated, which widens an integer key column to
+        float wherever the shallower depths have no value for it.  Rebuilding
+        the lookup key from the concatenated frame then produced "3.0" while
+        the data frame produced "3", so the deepest group matched *nothing* and
+        every row silently fell back a level — invisibly, because the run still
+        completed and still flagged things.
+        """
+        from EBA_detector.calibration import _null_key_array
+
+        df = _with_null_cols(_colocated_multires_world(per_level=6, n=120))
+        scored = _score_frame(df)
+        keys = ["label", "region", "res"]
+        _out, ref = _calibrate(scored, keys)
+        # Assert the string keys themselves match, independently of how much
+        # weight the deepest rung ends up carrying: every row's full-depth key
+        # must exist in the deepest rung of the reference.
+        deepest = int(ref["__null_depth__"].max())
+        assert deepest == len(keys), deepest
+        built = set(ref.loc[ref["__null_depth__"] == deepest, "__null_key__"])
+        rows = set(_null_key_array(scored, keys).tolist())
+        assert rows <= built, sorted(rows - built)[:5]
+
+    def test_resolution_key_separates_cell_sizes(self):
+        """The croptype fix.
+
+        Co-located L2/L3/L4 slices share one region.  Without the resolution
+        key the tight L4 slices inherit a scale inflated by the coarse L2 ones.
+        """
+        df = _with_null_cols(_colocated_multires_world(per_level=8, n=150, seed=1))
+        scored = _score_frame(df)
+        region_only, _ = _calibrate(scored, ["label", "region"])
+        with_res, _ = _calibrate(scored, ["label", "region", "res"])
+        fp_region = flag_world(region_only, mad_k=3.3, abs_z_k=3.3)["flagged"].mean()
+        fp_both = flag_world(with_res, mad_k=3.3, abs_z_k=3.3)["flagged"].mean()
+        assert fp_both < fp_region, (fp_both, fp_region)
+
+    def test_thin_group_backs_off_one_level_not_to_the_global(self):
+        """A conditioner must not strand the groups it thins.
+
+        The whole risk of adding the resolution key is that (class, region,
+        res) groups get thin — and for CROPTYPE24 most classes are rare.  A
+        thin group must keep whatever locality it can still support, and must
+        never be pushed onto the flat global null.
+        """
+        df = _with_null_cols(_colocated_multires_world(per_level=8, n=150, seed=2))
+        # Give one class a single L4 slice: too thin for its own depth-3 null.
+        rare = df[(df["label"] == "cls0") & (df["lvl"] == 4)]
+        keep_cell = sorted(rare["h3_l3_cell"].unique())[0]
+        drop = rare[rare["h3_l3_cell"] != keep_cell].index
+        df = df.drop(index=drop).reset_index(drop=True)
+
+        scored = _score_frame(df)
+        keys = ["label", "region", "res"]
+        out, _ref = _calibrate(scored, keys, min_slices=2)
+
+        thin = out[(out["label"] == "cls0") & (out["h3_l3_cell"] == keep_cell)]
+        assert len(thin) > 0
+        # Depth 0 is the flat, class-blind global null.  Nothing may land there
+        # while a class-level null exists.
+        assert (out["abs_z_null_depth"] >= 1).all()
+        assert (thin["abs_z_null_depth"] >= 1).all()
+
+    def test_reported_depth_is_the_rung_that_contributed(self):
+        """A w = 0 group equals its parent, and must be credited to the parent.
+
+        Otherwise the localisation histogram — the only instrument for "are
+        these keys too fine for this collection's density?" — reports a
+        locality the numbers do not have.
+        """
+        df = _with_null_cols(_colocated_multires_world(per_level=8, n=150, seed=7))
+        scored = _score_frame(df)
+        keys = ["label", "region", "res"]
+        # min_slices above every group's support: no rung can contribute, so
+        # every row must be credited to depth 0 even though depth-3 groups
+        # exist and match.
+        out, ref = _calibrate(scored, keys, min_slices=10_000)
+        assert (ref["__null_depth__"] == 3).any(), "depth-3 groups should exist"
+        assert (out["abs_z_null_depth"] == 0).all(), (
+            out["abs_z_null_depth"].value_counts().to_dict()
+        )
+
+    def test_ladder_shrinks_toward_the_parent_not_the_global(self):
+        df = _with_null_cols(_colocated_multires_world(per_level=8, n=150, seed=3))
+        scored = _score_frame(df)
+        _out, ref = _calibrate(scored, ["label", "region", "res"], shrink_k=5.0)
+        deep = ref[ref["__null_depth__"] == 3]
+        mid = ref[ref["__null_depth__"] == 2]
+        assert not deep.empty and not mid.empty
+        # Each depth-3 loc lies between its own raw estimate and its depth-2
+        # parent, so the depth-3 spread must not collapse onto the depth-2 one
+        # nor onto the single global value.
+        glob = ref[ref["__is_global__"] == True]  # noqa: E712
+        g = float(glob["cosine_distance_null_loc"].iloc[0])
+        d3 = deep["cosine_distance_null_loc"].to_numpy(dtype="float64")
+        assert np.nanstd(d3) > 0, d3
+        assert not np.allclose(d3, g), (d3, g)
+
+    def test_degenerate_scale_is_not_rescued_by_the_parent(self):
+        """The duplicate-heavy guard must survive the cascade.
+
+        A group with enough slices to *make* the claim keeps its NaN scale
+        rather than borrowing a finite one from its parent, so nothing in it
+        can be flagged on a hair trigger.
+        """
+        df = _duplicate_heavy_world(n_dup_slices=5, n_ord_slices=3, n=80, seed=4)
+        df["region"] = "R"
+        df["res"] = np.int16(3)
+        scored = _score_frame(df)
+        _out, ref = _calibrate(scored, ["label", "region", "res"], min_slices=2)
+        own = ref[ref["__is_global__"] == False]  # noqa: E712
+        deepest = int(own["__null_depth__"].max())
+        deep = own[own["__null_depth__"] == deepest]
+        assert deep["cosine_distance_null_scale"].isna().any()
+
+    def test_unsupported_degenerate_group_inherits_rather_than_dies(self):
+        """`w = 0` means "no opinion of my own" — including about degeneracy.
+
+        A single degenerate slice must not condemn a whole group to a NaN
+        scale, which would make every row in it unflaggable and unscored.  The
+        pre-ladder code got this right by dropping sub-`min_slices` groups
+        entirely; the cascade has to reproduce it deliberately.
+        """
+        df = _duplicate_heavy_world(n_dup_slices=1, n_ord_slices=6, n=80, seed=11)
+        scored = _score_frame(df)
+        keys = ["label"]
+        # The duplicate class contributes exactly one slice.
+        n_dup = int(
+            scored[scored["label"] != scored["label"].mode()[0]]["label"].nunique()
+        )
+        assert n_dup >= 0  # construction sanity only
+        _out, ref = _calibrate(scored, keys, min_slices=5)
+        own = ref[ref["__is_global__"] == False]  # noqa: E712
+        thin = own[own["n_slices"] < 5]
+        if len(thin):
+            # Every under-supported group carries a usable (parent) scale.
+            assert thin["cosine_distance_null_scale"].notna().all(), thin
+
+    def test_legacy_null_reference_without_depth_columns_still_works(self):
+        df = _with_null_cols(_colocated_multires_world(per_level=6, n=120, seed=5))
+        scored = _score_frame(df)
+        keys = ["label", "region", "res"]
+        ref = compute_null_reference(
+            scored, null_keys=keys, slice_key_cols=["h3_l3_cell", "label"],
+            scored_mask_col="scored",
+        )
+        legacy = ref[
+            (ref["__null_depth__"] == len(keys)) | (ref["__is_global__"] == True)  # noqa: E712
+        ].drop(columns=["__null_depth__", "__null_key__"])
+        out = add_absolute_scores(scored, legacy, null_keys=keys)
+        assert np.isfinite(out["abs_z"].to_numpy(dtype="float64")).any()
+
+    def test_single_key_run_is_unchanged_by_the_ladder(self):
+        """With one null key the ladder is one rung; behaviour must not move."""
+        df = _colocated_multires_world(per_level=6, n=120, seed=6)
+        scored = _score_frame(df)
+        out, ref = _calibrate(scored, ["label"])
+        assert set(ref["__null_depth__"].unique()) <= {0, 1}
+        assert (out.loc[out["scored"], "abs_z_null_depth"] == 1).all()
+
+    def test_missing_region_does_not_merge_classes(self):
+        """Regression: an NA key component used to annihilate the whole key.
+
+        Under pandas' string dtype ``astype(str)`` keeps NA as NA and NA
+        propagates through concatenation, so one underivable H3 region turned
+        the composite key into a single NA shared by EVERY class.  The
+        de-duplication kept one arbitrary group and every such row — of every
+        class — was calibrated against it.  Nothing raised, nothing printed.
+        """
+        df = _with_null_cols(_colocated_multires_world(per_level=6, n=120, seed=8))
+        # Half the slices lose their region, as a failed H3 parse would do.
+        cells = sorted(df["h3_l3_cell"].unique())
+        orphan = set(cells[::2])
+        df["region"] = [
+            None if c in orphan else r
+            for c, r in zip(df["h3_l3_cell"], df["region"])
+        ]
+        scored = _score_frame(df)
+        keys = ["label", "region", "res"]
+        _out, ref = _calibrate(scored, keys)
+
+        own = ref[ref["__is_global__"] == False]  # noqa: E712
+        no_region = own[own["region"].isna() & (own["__null_depth__"] >= 2)]
+        # One "unknown region" group per class (and per resolution), never one
+        # shared group that classes collide in.
+        assert len(no_region) >= 2, no_region
+        assert no_region["label"].nunique() > 1, no_region[["label", "region"]]
+        assert len(set(no_region["__null_key__"].tolist())) == len(no_region)
+
+    def test_missing_region_rows_keep_their_own_class_null(self):
+        """The sharp end of the same bug: cross-class calibration.
+
+        Two classes at very different distance scales, each with some slices
+        whose region is underivable.  If the NA keys collide, the tight class's
+        null is applied to the wide one and its rows score in the tens of
+        sigma.
+        """
+        r = np.random.default_rng(21)
+        rows = []
+        for label, sigma, offset in (("tight", 0.04, 0.0), ("wide", 0.30, 0.0)):
+            for s in range(6):
+                cell = f"cell_{label}_{s}"
+                centre = np.zeros(D)
+                centre[0] = 1.0 + offset
+                X = r.normal(size=(120, D)) * sigma + centre
+                for i in range(120):
+                    rows.append((f"{label}{s}_{i}", cell, label,
+                                 X[i].astype(np.float32),
+                                 None if s % 2 else f"R{label}", 3, False))
+        df = pd.DataFrame(rows, columns=["sample_id", "h3_l3_cell", "label",
+                                         "embedding", "region", "res", "truth"])
+        scored = _score_frame(df)
+        out, _ref = _calibrate(scored, ["label", "region", "res"])
+        wide_orphan = out[(out["label"] == "wide") & out["region"].isna()]
+        assert len(wide_orphan) > 0
+        z = pd.to_numeric(wide_orphan["cos_abs_z"], errors="coerce")
+        # Calibrated against its own class these sit near zero; against the
+        # tight class's null the repro measured a mean of 34 sigma.
+        assert abs(float(z.mean())) < 3.0, float(z.mean())
+
+    def test_a_rung_that_does_not_subdivide_is_dropped(self):
+        """Two identical rungs compose their shrinkage: w_eff = 1-(1-w)^2.
+
+        On a fixed single-resolution run `h3_null_res` is a constant, so a
+        naive third rung would re-shrink an already-shrunk estimate toward
+        itself — raising a thin group's weight on its own noisy estimate from
+        0.29 to 0.49 and quietly halving the insurance shrinkage provides.
+        """
+        # Two roots, so the REGION key genuinely subdivides; only `res` is
+        # constant, and only that rung should be dropped.
+        df = _with_null_cols(_two_root_single_resolution_world(seed=9))
+        scored = _score_frame(df)
+        _o2, ref2 = _calibrate(scored, ["label", "region"])
+        _o3, ref3 = _calibrate(scored, ["label", "region", "res"])
+        # `res` is constant here, so the third rung must not be built at all.
+        assert int(ref3["__null_depth__"].max()) == 2
+        cols = ["cosine_distance_null_loc", "cosine_distance_null_scale"]
+        a = ref2.sort_values(["__null_depth__", "__null_key__"])[cols].to_numpy()
+        b = ref3.sort_values(["__null_depth__", "__null_key__"])[cols].to_numpy()
+        assert np.allclose(a, b, equal_nan=True), (a, b)
+
+    def test_mismatched_null_keys_raise_instead_of_degrading(self):
+        """Silent degradation is the failure mode this whole change is about.
+
+        The ladder is indexed by prefix depth, so calibrating with a different
+        key list matches nothing and calibrates everything against a coarser
+        null — while the run completes and still produces flags.
+        """
+        df = _with_null_cols(_colocated_multires_world(per_level=6, n=120, seed=10))
+        scored = _score_frame(df)
+        ref = compute_null_reference(
+            scored, null_keys=["label", "region", "res"],
+            slice_key_cols=["h3_l3_cell", "label"], scored_mask_col="scored",
+        )
+        with pytest.raises(ValueError, match="null_keys"):
+            add_absolute_scores(scored, ref, null_keys=["label", "res", "region"])
+
+
+def _two_root_single_resolution_world(n=120, per_root=8, n_classes=3, seed=0):
+    """One resolution, two broad regions — so `region` subdivides and `res`
+    does not."""
+    import h3
+
+    r = np.random.default_rng(seed)
+    roots = [h3.latlng_to_cell(47.0, 2.0, 1), h3.latlng_to_cell(-15.0, -50.0, 1)]
+    cens = []
+    for _ in range(n_classes):
+        v = r.normal(size=D)
+        cens.append(v / np.linalg.norm(v))
+    rows = []
+    for ri, root in enumerate(roots):
+        sigma = 0.20 + 0.12 * ri
+        for s, cell in enumerate(sorted(h3.cell_to_children(root, 3))[:per_root]):
+            for c in range(n_classes):
+                X = r.normal(size=(n, D)) * sigma + cens[c]
+                for i in range(n):
+                    rows.append((f"r{ri}s{s}c{c}_{i}", cell, f"cls{c}",
+                                 X[i].astype(np.float32), 3, False))
+    return pd.DataFrame(
+        rows,
+        columns=["sample_id", "h3_l3_cell", "label", "embedding", "lvl", "truth"],
+    )
+
+
+class TestNullLadderDiagnostics:
+    """The ladder's instruments have to be trustworthy or they are worse than
+    nothing — an operator who learns to ignore a warning has lost the warning."""
+
+    def test_unscored_rows_do_not_trigger_the_coverage_warning(self, capsys):
+        """The null is built from scored slices, so unscored rows can never
+        match.  Counting them made the warning fire at 71 % on a healthy frame
+        while the message asserted sparsity was *not* the explanation."""
+        df = _with_null_cols(_colocated_multires_world(per_level=6, n=120, seed=12))
+        scored = _score_frame(df)
+        # Two thirds of the frame never reached the scoring threshold.
+        rng = np.random.default_rng(0)
+        unscored = rng.random(len(scored)) < 0.67
+        for c in ("cosine_distance", "knn_distance_fixed", "neighbourhood_offset"):
+            if c in scored.columns:
+                scored.loc[unscored, c] = np.nan
+        scored["scored"] = ~unscored
+
+        keys = ["label", "region", "res"]
+        ref = compute_null_reference(
+            scored, null_keys=keys, slice_key_cols=["h3_l3_cell", "label"],
+            scored_mask_col="scored",
+        )
+        capsys.readouterr()
+        add_absolute_scores(scored, ref, null_keys=keys)
+        assert "WARNING" not in capsys.readouterr().out
+
+    def test_a_real_key_mismatch_still_warns(self, capsys):
+        df = _with_null_cols(_colocated_multires_world(per_level=6, n=120, seed=13))
+        scored = _score_frame(df)
+        keys = ["label", "region", "res"]
+        ref = compute_null_reference(
+            scored, null_keys=keys, slice_key_cols=["h3_l3_cell", "label"],
+            scored_mask_col="scored",
+        )
+        # Same key names, values that exist nowhere in the reference.
+        broken = scored.copy()
+        broken["region"] = "not-a-region"
+        broken["res"] = np.int16(9)
+        broken["label"] = "not-a-class"
+        capsys.readouterr()
+        add_absolute_scores(broken, ref, null_keys=keys)
+        assert "WARNING" in capsys.readouterr().out
+
+    def test_sole_child_group_is_not_shrunk_twice(self):
+        """A group that is its parent's only child was estimated from exactly
+        the same slices.  Blending it toward the parent composes the two
+        shrinkages and moves it AWAY from the pooled estimate."""
+        import h3
+
+        # Two regions.  R0 holds a single resolution (so its (region, res)
+        # group is a sole child); R1 spans two resolutions that share ONE
+        # region — L2 and L3 both floor to L1 — so the rung is informative and
+        # the whole-rung skip does not fire.
+        r = np.random.default_rng(14)
+        roots = [h3.latlng_to_cell(47.0, 2.0, 1), h3.latlng_to_cell(-15.0, -50.0, 1)]
+        rows = []
+        for ri, root in enumerate(roots):
+            levels = (3,) if ri == 0 else (2, 3)
+            for lvl in levels:
+                for s, cell in enumerate(sorted(h3.cell_to_children(root, lvl))[:4]):
+                    sigma = 0.20 + 0.10 * ri
+                    X = r.normal(size=(120, D)) * sigma + np.eye(D)[0]
+                    for i in range(120):
+                        rows.append((f"r{ri}L{lvl}s{s}_{i}", cell, "cls0",
+                                     X[i].astype(np.float32), lvl, False))
+        df = pd.DataFrame(rows, columns=["sample_id", "h3_l3_cell", "label",
+                                         "embedding", "lvl", "truth"])
+        df = _with_null_cols(df)
+        scored = _score_frame(df)
+        _o2, ref2 = _calibrate(scored, ["label", "region"])
+        _o3, ref3 = _calibrate(scored, ["label", "region", "res"])
+        assert int(ref3["__null_depth__"].max()) == 3, "the rung must be kept"
+
+        def loc_for(ref, depth, region):
+            m = (ref["__null_depth__"] == depth) & (ref["region"] == region)
+            return ref.loc[m, "cosine_distance_null_loc"].to_numpy()
+
+        r0 = sorted(df.loc[df["sample_id"].str.startswith("r0"), "region"].unique())[0]
+        parent = loc_for(ref2, 2, r0)
+        child = loc_for(ref3, 3, r0)
+        assert len(parent) == 1 and len(child) == 1, (parent, child)
+        # Sole child: identical to its parent, not shrunk a second time.
+        assert np.allclose(parent, child), (parent, child)
